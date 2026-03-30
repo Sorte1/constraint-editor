@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>
+            Krunker Game Editor - Create Custom Maps & Games Online Free
+        </title>
+        <script src="./libs/frvr-sdk.min.js?build=Ab3Mm"></script>
+        <script src="./libs/frvr-channel-web.min.js?build=Ab3Mm"></script>
+        <script>
+            (!(function () {
+                const n = {};
+                let e = 0;
+                window.reportError = function (o, t) {
+                    if (e > 20) return;
+                    const i =
+                        ("string" == typeof o
+                            ? o
+                            : (o && o.message) || "unknown") +
+                        "|" +
+                        (t ? t.split("\n")[0] : "");
+                    if (((n[i] = (n[i] || 0) + 1), e++, n[i] > 5)) return;
+                    const r =
+                            "127.0.0.1:8080" !== location.host &&
+                            "localhost:8080" !== location.host &&
+                            !location.host.startsWith("192.168.") &&
+                            "localhost:18080" !== location.host,
+                        a = ["krunker.io", "browserfps.com"].includes(
+                            location.hostname,
+                        );
+                    fetch(
+                        (r && a
+                            ? "https://api.krunker.io"
+                            : r
+                              ? "https://api.beta.krunker.io"
+                              : "http://127.0.0.1:5080") + "/report/error",
+                        {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                error: o,
+                                stack: t,
+                                channel:
+                                    (FRVR &&
+                                        FRVR.channel &&
+                                        FRVR.channel.getId()) ||
+                                    "unknown",
+                            }),
+                        },
+                    ).catch((n) => {
+                        console.log("error", n);
+                    });
+                };
+            })(),
+                Math.random() < 0.1 &&
+                    ((window.onerror = function (n, e, o, t, i) {
+                        reportError(n, i?.stack);
+                    }),
+                    (window.onunhandledrejection = function (n) {
+                        reportError(
+                            n.reason?.message || n.reason,
+                            n.reason?.stack,
+                        );
+                    })),
+                (window.FRVR = window.FRVR || {}),
+                (window.FRVR.config =
+                    window.FRVR.config &&
+                    0 !== Object.keys(window.FRVR.config).length
+                        ? window.FRVR.config
+                        : {
+                              gameId: "krunker",
+                              ads: {
+                                  providers: [
+                                      {
+                                          name: "adsbygoogle-interstitial",
+                                          type: "interstitial",
+                                          priority: 1,
+                                          config: {},
+                                      },
+                                      {
+                                          name: "adsbygoogle-reward",
+                                          type: "reward",
+                                          priority: 1,
+                                          config: {},
+                                      },
+                                      {
+                                          name: "adsbygoogle",
+                                          type: "banner",
+                                          priority: 1,
+                                          config: {
+                                              banners: [
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_728x90",
+                                                      adUnitId: "2395420432",
+                                                      format: "728x90",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_728x90_2",
+                                                      adUnitId: "2638963013",
+                                                      format: "728x90",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_728x90_3",
+                                                      adUnitId: "6167144480",
+                                                      format: "728x90",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_728x90_4",
+                                                      adUnitId: "8601736132",
+                                                      format: "728x90",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x250",
+                                                      adUnitId: "6466527383",
+                                                      format: "300x250",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x250_2",
+                                                      adUnitId: "3725364885",
+                                                      format: "300x250",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x250_3",
+                                                      adUnitId: "1597344085",
+                                                      format: "300x250",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x250_4",
+                                                      adUnitId: "1273910454",
+                                                      format: "300x250",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x250_5",
+                                                      adUnitId: "3377329617",
+                                                      format: "300x250",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x600",
+                                                      adUnitId: "9152400479",
+                                                      format: "300x600",
+                                                  },
+                                                  {
+                                                      targetElementId:
+                                                          "krunker-io_300x600_2",
+                                                      adUnitId: "4323314500",
+                                                      format: "300x600",
+                                                  },
+                                              ],
+                                          },
+                                      },
+                                  ],
+                                  throttling: { maxfrequency: 0 },
+                              },
+                              abTests: {
+                                  register_gift_ad: {
+                                      active: !1,
+                                      cohorts: ["control", "enabled"],
+                                  },
+                              },
+                              consent: {
+                                  providerName: "cookiepro",
+                                  config: {
+                                      websiteKey:
+                                          "15b4472b-823a-468e-b5eb-6eeaca5d6de4",
+                                  },
+                              },
+                              tracker: {
+                                  trackerChannelId: "krunker_io",
+                                  analyticsProviders: {
+                                      metapixel: {
+                                          pixelId: "1361622040527227",
+                                      },
+                                      "google-analytics": {
+                                          disallowedEvents: [
+                                              "game_play_start",
+                                              "game_play_end",
+                                              "game_session_start",
+                                              "game_session_end",
+                                              "session_start",
+                                              "win_open",
+                                              "fps",
+                                              "item_flow",
+                                              "session_start",
+                                              "session_end",
+                                              "btn_click",
+                                          ],
+                                      },
+                                  },
+                              },
+                              features: { gameId: "GMD0Q8X" },
+                              storage: {
+                                  cookieMirror: {
+                                      keys: [
+                                          "__FRVR_auth_access_token",
+                                          "__FRVR_auth_refresh_token",
+                                      ],
+                                      domain: ".krunker.io",
+                                  },
+                              },
+                              auth: { enableAnonymousLogin: !0 },
+                          }));
+            const isSocial = document.location.pathname.includes("social.html"),
+                isMsPwa =
+                    -1 !==
+                        document.referrer.indexOf(
+                            "app-info://platform/microsoft-store",
+                        ) ||
+                    -1 !== window.location.search.indexOf("mspwa") ||
+                    -1 !== window.location.search.indexOf("msstart_sdk_init"),
+                userAgent = navigator.userAgent.toString(),
+                isSteamClient =
+                    window.isSteamBuild ||
+                    (userAgent.includes("io.krunker.steam") &&
+                        "io.krunker.steam" != userAgent),
+                isEpicClient = "epic" === window.storePlatform,
+                showCmp = !isMsPwa;
+            function loadingPopup(n) {
+                const e = document.createElement("span");
+                e.textContent = n;
+                const o = e.innerHTML;
+                genericPopup(
+                    `\n  \t\t<div style="width:100%;text-align:center">\n  \t\t\t<div class="lds-ring sm">\n  \t\t\t\t<div></div>\n  \t\t\t\t<div></div>\n  \t\t\t\t<div></div>\n  \t\t\t\t<div></div>\n  \t\t\t</div>\n  \t\t\t<div style="font-size:20px;color:rgba(255,255,255,0.5)">${o}</div>\n  \t\t</div>\n  \t`,
+                    "loadingPop",
+                );
+            }
+            (showCmp ||
+                (delete window.FRVR.config.tracker,
+                delete window.FRVR.config.consent),
+                (window.paymentsChannelId = isMsPwa ? "microsoft_pwa" : null),
+                (window.canShowExternalLinks = !isMsPwa),
+                (window.canShowPaypal = !isMsPwa),
+                (window.canShowSocialHub = !isMsPwa),
+                (window.canShowMods = !isMsPwa),
+                (window.canConnectExternalAccounts =
+                    window.canShowExternalLinks),
+                (window.canShowMarketplace = window.canShowSocialHub),
+                (window.canShowNFTs =
+                    !isMsPwa && !isSteamClient && !isEpicClient),
+                (window.canShowTwitch = window.canShowExternalLinks),
+                (window.canShowKrunkerEngine = window.canShowExternalLinks),
+                (window.forceMergeQueryString =
+                    isMsPwa && null != typeof URLPattern),
+                (window.playSelect = () => {}),
+                (window.playTick = () => {}),
+                (window.logBtnFRVR = () => {}),
+                (window.showWindowAfterLoad = 0),
+                (window.windows = []),
+                (window.resetPops = function () {
+                    ((popupHolder.style.zIndex = 2147483645),
+                        (popupHolder.style.display = "block"),
+                        (popupContent.style.display = "none"),
+                        (popupContent.style.backgroundColor = "#353535"),
+                        (itemViewPop.style.display = "none"),
+                        (policePop.style.display = "none"),
+                        (bundlePop.style.display = "none"),
+                        (premiumPop.style.display = "none"),
+                        (spinHistoryPop.style.display = "none"),
+                        (genericPop.style.display = "none"));
+                }),
+                (window.genericPopup = function (n, e, o) {
+                    return (
+                        resetPops(),
+                        e && genericPop.setAttribute("class", e),
+                        genericPop.setAttribute("style", o || ""),
+                        (genericPop.innerHTML = n),
+                        (genericPop.style.display = "block"),
+                        genericPop
+                    );
+                }),
+                (window.showWindow = function (n) {
+                    ((window.showWindowAfterLoad = n), loadingPopup());
+                }),
+                (window.clearPops = function () {
+                    (resetPops(),
+                        (popupHolder.style.zIndex = 2147483647),
+                        (popupHolder.style.display = "none"));
+                }),
+                Object.defineProperty(window, "canShowAds", {
+                    get: () => !isMsPwa && !isSteamClient && !isEpicClient,
+                    set() {},
+                }),
+                Object.defineProperty(window, "useFRVRSDKAds", {
+                    get: () => window.canShowAds,
+                    set() {},
+                }),
+                Object.defineProperty(window, "useFRVRSDKBannerAds", {
+                    get: () => window.canShowAds,
+                    set() {},
+                }),
+                window.useFRVRSDKAds ||
+                    (window.FRVR.config.ads && delete window.FRVR.config.ads),
+                window.FRVR.init("prod"),
+                window.FRVR.tracker.addExtraFieldFunction(function (n) {
+                    ((n.context = "krunker"),
+                        (n.app_version = "7.2.5"),
+                        window.storePlatform &&
+                        "standalone" !== window.storePlatform
+                            ? (n.channel = window.storePlatform)
+                            : isSteamClient
+                              ? (n.channel = "steam")
+                              : isMsPwa && (n.channel = "microsoft_pwa"));
+                }));
+        </script>
+        <script
+            async
+            src="https://www.googletagmanager.com/gtag/js?id=UA-69264675-5"
+        ></script>
+        <script>
+            function gtag() {
+                dataLayer.push(arguments);
+            }
+            ((window.dataLayer = window.dataLayer || []),
+                gtag("js", new Date()),
+                gtag("config", "UA-69264675-5"));
+        </script>
+        <link rel="shortcut icon" type="image/png" href="./img/favicon.png" />
+        <link rel="stylesheet" href="./css/editor.css?build=Ab3Mm" />
+        <link
+            rel="stylesheet"
+            title="dark"
+            href="./css/editor_dark.css?build=Ab3Mm"
+        />
+        <link rel="stylesheet" href="./css/editor_custom.css?build=Ab3Mm" />
+        <link rel="stylesheet" href="./css/pickr.css?build=Ab3Mm" />
+        <link
+            rel="stylesheet"
+            href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.61.0/codemirror.min.css"
+        />
+        <link
+            rel="stylesheet"
+            href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.61.0/theme/monokai.min.css"
+        />
+        <meta
+            name="viewport"
+            content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=0"
+        />
+        <meta
+            name="description"
+            content="Create custom games and maps with Krunker's powerful online editor. Build multiplayer experiences, design levels, and share your creations with the community. Free to use!"
+        />
+        <meta
+            name="keywords"
+            content="game editor, map creator, game development, level design, multiplayer games, browser game maker, free game tools"
+        />
+        <meta
+            property="og:title"
+            content="Krunker Game Editor - Create Custom Maps & Games"
+        />
+        <meta
+            property="og:image"
+            content="https://assets.krunker.io/promo/og.png"
+        />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://krunker.io/editor.html" />
+        <meta
+            property="og:description"
+            content="Create custom games and maps with Krunker's powerful online editor. Build multiplayer experiences, design levels, and share your creations with the community. Free to use!"
+        />
+        <script type="application/ld+json">
+            {
+                "@context": "https://schema.org",
+                "@type": "SoftwareApplication",
+                "name": "Krunker Game Editor",
+                "description": "Online game development tool for creating custom multiplayer games",
+                "applicationCategory": "GameDevelopmentApplication",
+                "operatingSystem": "Any",
+                "offers": {
+                    "@type": "Offer",
+                    "price": "0",
+                    "priceCurrency": "USD"
+                },
+                "featureList": [
+                    "Map Editor",
+                    "Game Creation",
+                    "Multiplayer Support",
+                    "Community Sharing"
+                ]
+            }
+        </script>
+        <script
+            type="module"
+            crossorigin
+            src="./static/editor-vMyAaODn.js"
+        ></script>
+        <link
+            rel="modulepreload"
+            crossorigin
+            href="./static/modulepreload-polyfill-B5Qt9EMX.js"
+        />
+        <link
+            rel="modulepreload"
+            crossorigin
+            href="./static/config-peKvycFE.js"
+        />
+        <link
+            rel="modulepreload"
+            crossorigin
+            href="./static/disclose-version-CuOEOPw1.js"
+        />
+        <link
+            rel="modulepreload"
+            crossorigin
+            href="./static/classes-C5vgPyVZ.js"
+        />
+        <link
+            rel="modulepreload"
+            crossorigin
+            href="./static/index-BMtisH_9.js"
+        />
+        <link
+            rel="modulepreload"
+            crossorigin
+            href="./static/render-DjVJADyH.js"
+        />
+        <link rel="stylesheet" crossorigin href="./static/index-D_KS-DaZ.css" />
+    </head>
+    <body oncontextmenu="return !1;">
+        <link
+            rel="stylesheet"
+            href="./css/google-secular-one.css?build=Ab3Mm"
+        /><link rel="stylesheet" href="./css/material-icons.css?build=Ab3Mm" />
+        <div id="vignette"></div>
+        <div id="uiBase">
+            <script
+                type="module"
+                src="./libs/altcha.1.0.6.min.js?build=Ab3Mm"
+            ></script>
+            <div id="popupHolder">
+                <div id="popupBack" onclick="clearPops()"></div>
+                <div id="popupContent"></div>
+                <div id="genericPop"></div>
+            </div>
+            <div id="menuHolder">
+                <div id="menuHider" style="display: none">
+                    <div id="windowHolder" style="display: none">
+                        <div id="windowHeader"></div>
+                        <div id="menuWindow"></div>
+                    </div>
+                </div>
+            </div>
+            <div id="hotbar">
+                <div id="_toolbar"></div>
+                <div id="playbar">
+                    <div
+                        class="playbarItemL"
+                        onclick="KE.testMap()"
+                        oncontextmenu="KE.testMap(!1, !0)"
+                    >
+                        <i
+                            class="material-icons"
+                            style="color: #202020; font-size: 25px"
+                            >play_arrow</i
+                        >
+                    </div>
+                    <div class="playbarItemR" onclick="KE.testMap(!0)">
+                        <i
+                            class="material-icons"
+                            style="color: #202020; font-size: 25px"
+                            >video_settings</i
+                        >
+                    </div>
+                    <div class="playbarItemR" onclick="KE.teleportPopup()">
+                        <i
+                            class="material-icons"
+                            style="color: #202020; font-size: 25px"
+                            >explore</i
+                        >
+                    </div>
+                </div>
+                <div id="rightMenu"><div id="versionTxt"></div></div>
+            </div>
+            <div id="view">
+                <div
+                    class="left restore"
+                    style="left: 0"
+                    onclick="KE.resizable.restore(this)"
+                >
+                    <i class="material-icons">keyboard_arrow_right</i>
+                </div>
+                <div
+                    class="left panel"
+                    onscroll="GUI.update.color.pickr.hide()"
+                >
+                    <div class="resize" style="left: calc(100% - 5px)"></div>
+                    <div class="list"></div>
+                </div>
+                <div id="center">
+                    <canvas
+                        id="editor-overlay"
+                        oncontextmenu="return !1;"
+                        style="
+                            position: absolute;
+                            pointer-events: none;
+                            z-index: 1;
+                        "
+                    ></canvas>
+                    <div id="container"></div>
+                    <div id="canvasUI">
+                        <div id="transform">
+                            <div id="translateOption" class="eButton">
+                                <i
+                                    class="material-icons"
+                                    style="
+                                        transform: rotate(45deg);
+                                        font-size: 20px;
+                                        margin: -1px;
+                                    "
+                                    >zoom_out_map</i
+                                >
+                            </div>
+                            <div id="rotateOption" class="eButton">
+                                <i class="material-icons">loop</i>
+                            </div>
+                            <div id="scaleOption" class="eButton">
+                                <i class="material-icons">zoom_out_map</i>
+                            </div>
+                        </div>
+                        <div id="spaceOption" class="eButton">World</div>
+                        <div id="faceOption" class="eButton">
+                            Face Selection: OFF
+                        </div>
+                        <div id="groupOption" class="eButton">
+                            Group Selection: OFF
+                        </div>
+                        <div id="wireframeOption" class="eButton">
+                            Wireframe: OFF
+                        </div>
+                        <div id="snappingOption" class="eButton">
+                            Snapping: OFF
+                        </div>
+                        <div id="chatHolder"><div id="chatList"></div></div>
+                    </div>
+                    <div id="canvasInfo">
+                        <div class="statTitle">Spawn Points</div>
+                        <div id="spawnCount" class="stat">0 / 20</div>
+                        <div class="statTitle">Collidable Objects</div>
+                        <div id="objectColCount" class="stat">0</div>
+                        <div class="statTitle">Non-Collidable Objects</div>
+                        <div id="objectNoColCount" class="stat">0</div>
+                        <div
+                            class="statTitle"
+                            id="eventHolder"
+                            style="display: none"
+                        >
+                            Event Objects
+                        </div>
+                        <div id="eventCount" class="stat" style="display: none">
+                            0 / 10
+                        </div>
+                        <div class="statTitle" id="serverNodeHolder">
+                            Server Nodes
+                        </div>
+                        <div id="serverNodeCount" class="stat">0</div>
+                        <div class="statTitle">Total Objects</div>
+                        <div id="objectCount" class="stat">0</div>
+                    </div>
+                    <div id="canvasAdd"><div>+</div></div>
+                    <div id="canvasObjEdit">
+                        <div id="deleteOption" class="eButton">Delete</div>
+                        <div id="duplicateOption" class="eButton">
+                            Duplicate
+                        </div>
+                    </div>
+                </div>
+                <div class="right restore" onclick="KE.resizable.restore(this)">
+                    <i class="material-icons">keyboard_arrow_left</i>
+                </div>
+                <div
+                    class="right panel"
+                    onscroll="GUI.update.color.pickr.hide()"
+                >
+                    <div class="resize"></div>
+                    <div class="list"></div>
+                </div>
+            </div>
+            <div id="editorUI">
+                <div id="progress"></div>
+                <div id="instructionHolder" onclick="closeWindow()"></div>
+            </div>
+        </div>
+        <div id="viewStack"></div>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.61.0/codemirror.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.61.1/addon/mode/simple.js"></script>
+        <script src="./libs/Tween.min.js?build=Ab3Mm"></script>
+        <script src="./libs/howler.min.js?build=Ab3Mm"></script>
+        <script src="./libs/quicksettings.js"></script>
+        <script src="./libs/pickr.min.js?build=Ab3Mm"></script>
+        <script src="./libs/jszip.min.js?build=Ab3Mm"></script>
+        <script src="./libs/fflate.min.js?build=Ab3Mm"></script>
+    </body>
+</html>
