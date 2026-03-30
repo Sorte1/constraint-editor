@@ -15841,7 +15841,6 @@
     "PlaneCheckpoint",
     "LineSegment",
     "Corridor",
-    "JumpArc",
     "TakeoffZone",
     "LandingZone",
     "AirborneSegment",
@@ -15861,6 +15860,22 @@
   function finiteOr(value, fallback2) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback2;
+  }
+  function normalizeTrainNode(n) {
+    return {
+      cx: finiteOr(n?.cx, 0),
+      cy: finiteOr(n?.cy, 0),
+      cz: finiteOr(n?.cz, 0),
+      hitboxType: HITBOX_TYPES.includes(n?.hitboxType) ? n.hitboxType : "sphere",
+      radius: Math.max(0.01, finiteOr(n?.radius, 8)),
+      height: Math.max(0.01, finiteOr(n?.height, 6)),
+      sizeX: Math.max(0.01, finiteOr(n?.sizeX, 8)),
+      sizeY: Math.max(0.01, finiteOr(n?.sizeY, 8)),
+      sizeZ: Math.max(0.01, finiteOr(n?.sizeZ, 8))
+    };
+  }
+  function createDefaultTrainNode(position) {
+    return normalizeTrainNode({ cx: position?.x, cy: position?.y, cz: position?.z });
   }
   function defaultConstraintFields(type, position) {
     const cx = finiteOr(position?.x, 0);
@@ -16008,6 +16023,15 @@
     c.landingSizeX = Math.max(0.01, finiteOr(c.landingSizeX, c.sizeX));
     c.landingSizeY = Math.max(0.01, finiteOr(c.landingSizeY, c.sizeY));
     c.landingSizeZ = Math.max(0.01, finiteOr(c.landingSizeZ, c.sizeZ));
+    if (type === "JumpArc") {
+      if (typeof c.trainGroupId !== "string" || !c.trainGroupId.trim()) {
+        delete c.trainGroupId;
+        delete c.trainIndex;
+      } else {
+        c.trainGroupId = c.trainGroupId.trim();
+        c.trainIndex = Math.max(0, Math.floor(finiteOr(c.trainIndex, 0)));
+      }
+    }
     return next2;
   }
   function createDocument(mapRef, constraints = []) {
@@ -16030,6 +16054,8 @@
     toolMode: "select",
     placementArmed: false,
     placementTarget: "center",
+    trainPlacementGroupId: null,
+    trainPendingNode: null,
     viewportCursor: null,
     editorIntegration: {
       mapRef: "unknown-map",
@@ -16062,13 +16088,60 @@
     dirty: false
   };
   function createStore(initialState = {}) {
+    function normalizeRecords(records = []) {
+      const out = [];
+      for (const raw of records) {
+        const record = normalizeConstraintRecord(raw);
+        const c = record.constraint || {};
+        if (c.type === "JumpTrain" && Array.isArray(c.nodes) && c.nodes.length >= 2) {
+          const groupId = globalThis.crypto?.randomUUID?.() || `train-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          for (let i = 0; i < c.nodes.length - 1; i++) {
+            const n0 = c.nodes[i];
+            const n1 = c.nodes[i + 1];
+            const arc = createDefaultConstraint("JumpArc", {
+              x: n0.cx,
+              y: n0.cy,
+              z: n0.cz
+            });
+            arc.label = `${record.label || "Jump Train"} ${i + 1}`;
+            arc.enabled = record.enabled;
+            arc.constraint = {
+              ...arc.constraint,
+              trainGroupId: groupId,
+              trainIndex: i,
+              takeoffCx: n0.cx,
+              takeoffCy: n0.cy,
+              takeoffCz: n0.cz,
+              takeoffHitboxType: n0.hitboxType,
+              takeoffRadius: n0.radius,
+              takeoffHeight: n0.height,
+              takeoffSizeX: n0.sizeX,
+              takeoffSizeY: n0.sizeY,
+              takeoffSizeZ: n0.sizeZ,
+              landingCx: n1.cx,
+              landingCy: n1.cy,
+              landingCz: n1.cz,
+              landingHitboxType: n1.hitboxType,
+              landingRadius: n1.radius,
+              landingHeight: n1.height,
+              landingSizeX: n1.sizeX,
+              landingSizeY: n1.sizeY,
+              landingSizeZ: n1.sizeZ,
+              jumpYVel: Number(c.arcParams?.[i]?.jumpYVel ?? 0.072)
+            };
+            out.push(normalizeConstraintRecord(arc));
+          }
+        } else {
+          out.push(record);
+        }
+      }
+      return out;
+    }
     const subscribers = /* @__PURE__ */ new Set();
     let state2 = {
       ...defaultState,
       ...initialState,
-      constraints: (initialState.constraints || []).map(
-        (record) => normalizeConstraintRecord(record)
-      )
+      constraints: normalizeRecords(initialState.constraints || [])
     };
     function setState(updater) {
       state2 = typeof updater === "function" ? updater(state2) : { ...state2, ...updater };
@@ -16118,6 +16191,103 @@
         history: { ...history, past, future: [] }
       };
     }
+    function makeTrainGroupId() {
+      if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+      return `train-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    function isGroupedJumpArc(record) {
+      return record?.constraint?.type === "JumpArc" && typeof record.constraint.trainGroupId === "string" && record.constraint.trainGroupId.length > 0;
+    }
+    function resolveTrainGroupId(records, idOrGroup) {
+      if (!idOrGroup) return null;
+      const byId = records.find((r) => r.id === idOrGroup);
+      if (isGroupedJumpArc(byId)) return byId.constraint.trainGroupId;
+      const hasGroup = records.some(
+        (r) => isGroupedJumpArc(r) && r.constraint.trainGroupId === idOrGroup
+      );
+      return hasGroup ? idOrGroup : null;
+    }
+    function getTrainGroupArcs(records, idOrGroup) {
+      const groupId = resolveTrainGroupId(records, idOrGroup);
+      if (!groupId) return [];
+      const order = new Map(records.map((r, i) => [r.id, i]));
+      return records.filter((r) => isGroupedJumpArc(r) && r.constraint.trainGroupId === groupId).sort(
+        (a, b) => Number(a.constraint.trainIndex ?? 0) - Number(b.constraint.trainIndex ?? 0) || Number(order.get(a.id) ?? 0) - Number(order.get(b.id) ?? 0)
+      );
+    }
+    function patchArcNodeSide(arcRecord, side, patch) {
+      const c = arcRecord.constraint || {};
+      const prefix = side === "takeoff" ? "takeoff" : "landing";
+      const nextConstraint = { ...c };
+      if ("cx" in patch) nextConstraint[`${prefix}Cx`] = Number(patch.cx);
+      if ("cy" in patch) nextConstraint[`${prefix}Cy`] = Number(patch.cy);
+      if ("cz" in patch) nextConstraint[`${prefix}Cz`] = Number(patch.cz);
+      if ("hitboxType" in patch) nextConstraint[`${prefix}HitboxType`] = patch.hitboxType;
+      if ("radius" in patch) nextConstraint[`${prefix}Radius`] = Number(patch.radius);
+      if ("height" in patch) nextConstraint[`${prefix}Height`] = Number(patch.height);
+      if ("sizeX" in patch) nextConstraint[`${prefix}SizeX`] = Number(patch.sizeX);
+      if ("sizeY" in patch) nextConstraint[`${prefix}SizeY`] = Number(patch.sizeY);
+      if ("sizeZ" in patch) nextConstraint[`${prefix}SizeZ`] = Number(patch.sizeZ);
+      return normalizeConstraintRecord({ ...arcRecord, constraint: nextConstraint });
+    }
+    function trainNodeFromArcSide(arcRecord, side) {
+      const c = arcRecord.constraint || {};
+      const prefix = side === "takeoff" ? "takeoff" : "landing";
+      const node = createDefaultTrainNode({
+        x: c[`${prefix}Cx`],
+        y: c[`${prefix}Cy`],
+        z: c[`${prefix}Cz`]
+      });
+      node.hitboxType = c[`${prefix}HitboxType`] ?? node.hitboxType;
+      node.radius = Number(c[`${prefix}Radius`] ?? node.radius);
+      node.height = Number(c[`${prefix}Height`] ?? node.height);
+      node.sizeX = Number(c[`${prefix}SizeX`] ?? node.sizeX);
+      node.sizeY = Number(c[`${prefix}SizeY`] ?? node.sizeY);
+      node.sizeZ = Number(c[`${prefix}SizeZ`] ?? node.sizeZ);
+      return node;
+    }
+    function normalizeTrainGroupIndices(records, groupId) {
+      const arcs = getTrainGroupArcs(records, groupId);
+      const nextIndexById = new Map(arcs.map((arc, index2) => [arc.id, index2]));
+      return records.map((record) => {
+        if (!isGroupedJumpArc(record)) return record;
+        if (record.constraint.trainGroupId !== groupId) return record;
+        const idx = nextIndexById.get(record.id);
+        if (!Number.isFinite(idx)) return record;
+        return normalizeConstraintRecord({
+          ...record,
+          constraint: { ...record.constraint, trainIndex: idx }
+        });
+      });
+    }
+    function getTrainGroupViewFromConstraints(records, idOrGroup, pendingNode = null) {
+      const arcs = getTrainGroupArcs(records, idOrGroup);
+      const groupId = resolveTrainGroupId(records, idOrGroup) || idOrGroup;
+      if (!groupId) return null;
+      if (!arcs.length) {
+        return {
+          groupId,
+          arcIds: [],
+          nodes: pendingNode ? [createDefaultTrainNode(pendingNode)] : [],
+          arcParams: [],
+          enabled: true
+        };
+      }
+      const nodes = [trainNodeFromArcSide(arcs[0], "takeoff")];
+      for (const arc of arcs) {
+        nodes.push(trainNodeFromArcSide(arc, "landing"));
+      }
+      const arcParams = arcs.map((arc) => ({
+        jumpYVel: Number(arc.constraint.jumpYVel ?? 0.072)
+      }));
+      return {
+        groupId,
+        arcIds: arcs.map((a) => a.id),
+        nodes,
+        arcParams,
+        enabled: arcs.some((a) => a.enabled !== false)
+      };
+    }
     const actions = {
       subscribe(cb) {
         subscribers.add(cb);
@@ -16131,18 +16301,14 @@
         setState({
           ...defaultState,
           ...nextState,
-          constraints: (nextState.constraints || []).map(
-            (record) => normalizeConstraintRecord(record)
-          )
+          constraints: normalizeRecords(nextState.constraints || [])
         });
       },
       importDocument(doc) {
         setState(
           (s) => withHistory(s, () => ({
             ...s,
-            constraints: (doc.constraints || []).map(
-              (record) => normalizeConstraintRecord(record)
-            ),
+            constraints: normalizeRecords(doc.constraints || []),
             savedPositions: [...doc.savedPositions || []],
             visuals: { ...s.visuals, ...doc.visuals || {} },
             ui: { ...s.ui, ...doc.ui || {} },
@@ -16224,6 +16390,10 @@
         });
         clone.label = `${source2.label} copy`;
         clone.constraint = { ...clone.constraint, ...source2.constraint };
+        if (clone.constraint.type === "JumpArc") {
+          delete clone.constraint.trainGroupId;
+          delete clone.constraint.trainIndex;
+        }
         setState(
           (s) => withHistory(s, () => ({
             ...s,
@@ -16374,6 +16544,186 @@
       },
       clearDirty() {
         setState((s) => ({ ...s, dirty: false }));
+      },
+      startJumpTrain() {
+        const groupId = makeTrainGroupId();
+        setState(
+          (s) => withHistory(s, () => ({
+            ...s,
+            trainPlacementGroupId: groupId,
+            trainPendingNode: null,
+            placementArmed: true,
+            placementTarget: "trainNode",
+            toolMode: "place"
+          }))
+        );
+        return groupId;
+      },
+      addTrainNode(point) {
+        setState(
+          (s) => withHistory(s, () => {
+            const groupId = s.trainPlacementGroupId;
+            if (!groupId) return s;
+            const arcs = getTrainGroupArcs(s.constraints, groupId);
+            const newNode = createDefaultTrainNode(point);
+            if (!arcs.length && !s.trainPendingNode) {
+              return markDirty({
+                ...s,
+                trainPendingNode: newNode
+              });
+            }
+            const startNode = arcs.length ? trainNodeFromArcSide(arcs[arcs.length - 1], "landing") : s.trainPendingNode;
+            if (!startNode) return s;
+            const arc = createDefaultConstraint("JumpArc", point);
+            arc.label = "Jump Arc";
+            arc.constraint = {
+              ...arc.constraint,
+              trainGroupId: groupId,
+              trainIndex: arcs.length,
+              takeoffCx: startNode.cx,
+              takeoffCy: startNode.cy,
+              takeoffCz: startNode.cz,
+              takeoffHitboxType: startNode.hitboxType,
+              takeoffRadius: startNode.radius,
+              takeoffHeight: startNode.height,
+              takeoffSizeX: startNode.sizeX,
+              takeoffSizeY: startNode.sizeY,
+              takeoffSizeZ: startNode.sizeZ,
+              landingCx: newNode.cx,
+              landingCy: newNode.cy,
+              landingCz: newNode.cz,
+              landingHitboxType: newNode.hitboxType,
+              landingRadius: newNode.radius,
+              landingHeight: newNode.height,
+              landingSizeX: newNode.sizeX,
+              landingSizeY: newNode.sizeY,
+              landingSizeZ: newNode.sizeZ
+            };
+            const normalizedArc = normalizeConstraintRecord(arc);
+            return markDirty({
+              ...s,
+              constraints: [...s.constraints, normalizedArc],
+              selectedConstraintId: normalizedArc.id,
+              trainPendingNode: null
+            });
+          })
+        );
+      },
+      finishJumpTrain() {
+        setState((s) => {
+          const groupId = s.trainPlacementGroupId;
+          if (!groupId) return s;
+          const arcs = getTrainGroupArcs(s.constraints, groupId);
+          const base = {
+            ...s,
+            trainPlacementGroupId: null,
+            trainPendingNode: null,
+            placementArmed: false,
+            placementTarget: "center",
+            toolMode: "select"
+          };
+          if (!arcs.length) return base;
+          return markDirty(base);
+        });
+      },
+      updateTrainNode(idOrGroup, nodeIndex, patch) {
+        setState(
+          (s) => withHistory(s, () => {
+            const arcs = getTrainGroupArcs(s.constraints, idOrGroup);
+            if (!arcs.length) return s;
+            const maxNodeIndex = arcs.length;
+            if (nodeIndex < 0 || nodeIndex > maxNodeIndex) return s;
+            const byId = new Map(s.constraints.map((r) => [r.id, r]));
+            if (nodeIndex === 0) {
+              byId.set(arcs[0].id, patchArcNodeSide(arcs[0], "takeoff", patch));
+            } else if (nodeIndex === maxNodeIndex) {
+              const lastArc = arcs[arcs.length - 1];
+              byId.set(lastArc.id, patchArcNodeSide(lastArc, "landing", patch));
+            } else {
+              const prevArc = arcs[nodeIndex - 1];
+              const nextArc = arcs[nodeIndex];
+              byId.set(prevArc.id, patchArcNodeSide(prevArc, "landing", patch));
+              byId.set(nextArc.id, patchArcNodeSide(nextArc, "takeoff", patch));
+            }
+            return {
+              ...s,
+              constraints: s.constraints.map((r) => byId.get(r.id) || r)
+            };
+          })
+        );
+      },
+      updateTrainArcParams(idOrGroup, arcIndex, patch) {
+        setState(
+          (s) => withHistory(s, () => {
+            const arcs = getTrainGroupArcs(s.constraints, idOrGroup);
+            if (!arcs.length || arcIndex < 0 || arcIndex >= arcs.length) return s;
+            const target = arcs[arcIndex];
+            const updated = normalizeConstraintRecord({
+              ...target,
+              constraint: {
+                ...target.constraint,
+                ...patch.jumpYVel != null ? { jumpYVel: Number(patch.jumpYVel) } : {}
+              }
+            });
+            return {
+              ...s,
+              constraints: s.constraints.map((r) => r.id === target.id ? updated : r)
+            };
+          })
+        );
+      },
+      removeTrainNode(idOrGroup, nodeIndex) {
+        setState(
+          (s) => withHistory(s, () => {
+            const arcs = getTrainGroupArcs(s.constraints, idOrGroup);
+            if (!arcs.length) return s;
+            const nodeCount = arcs.length + 1;
+            if (nodeIndex < 0 || nodeIndex >= nodeCount) return s;
+            const removeIds = /* @__PURE__ */ new Set();
+            const byId = /* @__PURE__ */ new Map();
+            if (arcs.length === 1) {
+              removeIds.add(arcs[0].id);
+            } else if (nodeIndex === 0) {
+              removeIds.add(arcs[0].id);
+            } else if (nodeIndex === nodeCount - 1) {
+              removeIds.add(arcs[arcs.length - 1].id);
+            } else {
+              const prevArc = arcs[nodeIndex - 1];
+              const nextArc = arcs[nodeIndex];
+              const patchedPrev = normalizeConstraintRecord({
+                ...prevArc,
+                constraint: {
+                  ...prevArc.constraint,
+                  landingCx: nextArc.constraint.takeoffCx,
+                  landingCy: nextArc.constraint.takeoffCy,
+                  landingCz: nextArc.constraint.takeoffCz,
+                  landingHitboxType: nextArc.constraint.takeoffHitboxType,
+                  landingRadius: nextArc.constraint.takeoffRadius,
+                  landingHeight: nextArc.constraint.takeoffHeight,
+                  landingSizeX: nextArc.constraint.takeoffSizeX,
+                  landingSizeY: nextArc.constraint.takeoffSizeY,
+                  landingSizeZ: nextArc.constraint.takeoffSizeZ
+                }
+              });
+              byId.set(prevArc.id, patchedPrev);
+              removeIds.add(nextArc.id);
+            }
+            let nextConstraints = s.constraints.filter((r) => !removeIds.has(r.id)).map((r) => byId.get(r.id) || r);
+            const groupId = arcs[0].constraint.trainGroupId;
+            nextConstraints = normalizeTrainGroupIndices(nextConstraints, groupId);
+            const selectedStillExists = nextConstraints.some((r) => r.id === s.selectedConstraintId);
+            return {
+              ...s,
+              constraints: nextConstraints,
+              selectedConstraintId: selectedStillExists ? s.selectedConstraintId : null
+            };
+          })
+        );
+      },
+      getTrainGroupView(idOrGroup) {
+        const groupId = resolveTrainGroupId(state2.constraints, idOrGroup) || idOrGroup;
+        const pending2 = groupId && state2.trainPlacementGroupId === groupId ? state2.trainPendingNode : null;
+        return getTrainGroupViewFromConstraints(state2.constraints, idOrGroup, pending2);
       }
     };
     return actions;
@@ -22645,78 +22995,143 @@ ${component_stack}
     return JSON.stringify(createConstraintsOnlyPayload(documentState), null, 2);
   }
   function createConstraintsOnlyPayload(documentState) {
+    const expanded = [];
+    for (const rawRecord of documentState?.constraints || []) {
+      const record = normalizeConstraintRecord(rawRecord);
+      const c = record.constraint || {};
+      if (c.type === "JumpTrain" && Array.isArray(c.nodes) && c.nodes.length >= 2) {
+        for (let i = 0; i < c.nodes.length - 1; i++) {
+          const n0 = c.nodes[i];
+          const n1 = c.nodes[i + 1];
+          const arc = createDefaultConstraint("JumpArc", {
+            x: n0.cx,
+            y: n0.cy,
+            z: n0.cz
+          });
+          arc.enabled = record.enabled;
+          arc.label = `${record.label || "Jump Train"} ${i + 1}`;
+          arc.constraint = {
+            ...arc.constraint,
+            takeoffCx: n0.cx,
+            takeoffCy: n0.cy,
+            takeoffCz: n0.cz,
+            takeoffHitboxType: n0.hitboxType,
+            takeoffRadius: n0.radius,
+            takeoffHeight: n0.height,
+            takeoffSizeX: n0.sizeX,
+            takeoffSizeY: n0.sizeY,
+            takeoffSizeZ: n0.sizeZ,
+            landingCx: n1.cx,
+            landingCy: n1.cy,
+            landingCz: n1.cz,
+            landingHitboxType: n1.hitboxType,
+            landingRadius: n1.radius,
+            landingHeight: n1.height,
+            landingSizeX: n1.sizeX,
+            landingSizeY: n1.sizeY,
+            landingSizeZ: n1.sizeZ,
+            jumpYVel: Number(c.arcParams?.[i]?.jumpYVel ?? 0.072)
+          };
+          expanded.push(normalizeConstraintRecord(arc));
+        }
+        continue;
+      }
+      if (c.type === "JumpArc") {
+        const stripped = normalizeConstraintRecord({
+          ...record,
+          constraint: { ...c }
+        });
+        delete stripped.constraint.trainGroupId;
+        delete stripped.constraint.trainIndex;
+        expanded.push(stripped);
+        continue;
+      }
+      expanded.push(record);
+    }
     return {
       version: 1,
-      constraints: (documentState?.constraints || []).map(
-        (record) => normalizeConstraintRecord(record)
-      )
+      constraints: expanded
     };
   }
 
   // src/modules/svelte/App.svelte
   var root_1 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_2 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Raycast armed \u2014 click map`, 1);
-  var root_4 = from_html(`<span class="stat stat-off svelte-1nhql4u"> </span>`);
-  var root_6 = from_html(`<span class="citem-badge off svelte-1nhql4u">OFF</span>`);
-  var root_7 = from_html(`<span class="citem-badge sel svelte-1nhql4u">SEL</span>`);
-  var root_5 = from_html(`<button draggable="true"><span class="citem-accent svelte-1nhql4u"></span> <span class="citem-num svelte-1nhql4u"> </span> <span class="citem-icon svelte-1nhql4u"> </span> <span class="citem-body svelte-1nhql4u"><span class="citem-label svelte-1nhql4u"> </span> <span class="citem-type svelte-1nhql4u"> </span></span> <!> <span class="citem-handle svelte-1nhql4u" title="Drag to reorder">\u283F</span></button>`);
-  var root_8 = from_html(`<div class="clist-empty svelte-1nhql4u"> </div>`);
-  var root_9 = from_html(`<button> </button>`);
-  var root_12 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_13 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Direction Normal</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
+  var root_2 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Building train\u2026 Enter/Esc to finish`, 1);
+  var root_4 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Raycast armed \u2014 click map`, 1);
+  var root_6 = from_html(`<span class="stat stat-off svelte-1nhql4u"> </span>`);
+  var root_8 = from_html(`<span class="citem-badge off svelte-1nhql4u">OFF</span>`);
+  var root_9 = from_html(`<span class="citem-badge sel svelte-1nhql4u">SEL</span>`);
+  var root_7 = from_html(`<button><span class="citem-accent svelte-1nhql4u"></span> <span class="citem-num svelte-1nhql4u"> </span> <span class="citem-icon svelte-1nhql4u"> </span> <span class="citem-body svelte-1nhql4u"><span class="citem-label svelte-1nhql4u"> </span> <span class="citem-type svelte-1nhql4u"> </span></span> <!> <span class="citem-handle svelte-1nhql4u" title="Drag to reorder"> </span></button>`);
+  var root_10 = from_html(`<div class="clist-empty svelte-1nhql4u"> </div>`);
+  var root_11 = from_html(`<button> </button>`);
   var root_15 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_16 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_17 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_18 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_14 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Hitbox</div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`);
-  var root_20 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_22 = from_html(`<div class="dim-note svelte-1nhql4u">Airborne box uses start/end as opposite corners.</div>`);
-  var root_23 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_24 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">thickness radius</span></div>`);
-  var root_19 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment Start</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Start</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment End</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick End</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
-  var root_25 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Jump Physics</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0.001"/> <span class="dim-note svelte-1nhql4u">jump y-vel</span></div></div>`);
-  var root_27 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_28 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_29 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_30 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_31 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Click to lock in`, 1);
-  var root_33 = from_html(`<button class="btn btn-xs btn-danger svelte-1nhql4u">Clear</button>`);
-  var root_34 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div></div>`);
-  var root_35 = from_html(`<div class="dim-note svelte-1nhql4u">No sample \u2014 arc starts from takeoff zone center.</div>`);
-  var root_36 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_37 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_38 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_39 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_26 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Takeoff</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Takeoff</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Takeoff Sample</div> <div class="field-actions svelte-1nhql4u"><button><!></button> <!></div></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Landing</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Landing</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
-  var root_40 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
-  var root_41 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Range</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Yaw Min</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Yaw Max</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
-  var root_42 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Velocity Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Target Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
-  var root_43 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Speed Window</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Max Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
-  var root_44 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Turn Constraint</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">max delta rad</span></div></div>`);
-  var root_46 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_45 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Required State</div> <select class="input svelte-1nhql4u"></select></div>`);
-  var root_47 = from_html(`<div class="cursor-info svelte-1nhql4u"><span class="cursor-label svelte-1nhql4u">Cursor hit</span> <span class="cursor-coords mono svelte-1nhql4u"> </span></div>`);
-  var root_49 = from_html(`<span class="readout-item svelte-1nhql4u">bx <b class="svelte-1nhql4u"> </b></span>`);
-  var root_48 = from_html(`<div class="readout svelte-1nhql4u"><span class="readout-item svelte-1nhql4u">cx <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cy <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cz <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">r <b class="svelte-1nhql4u"> </b></span> <!></div>`);
-  var root_11 = from_html(`<div class="pane svelte-1nhql4u"><div class="constraint-titlebar svelte-1nhql4u"><span class="ct-icon svelte-1nhql4u"> </span> <span class="ct-type svelte-1nhql4u"> </span> <span class="ct-spacer svelte-1nhql4u"></span> <button> </button> <button class="btn btn-sm svelte-1nhql4u" title="Duplicate (Ctrl+D)">\u29C9 Dupe</button> <button class="btn btn-danger btn-sm svelte-1nhql4u" title="Delete (Del)">\u2715 Del</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Label</div> <div class="row gap-8 svelte-1nhql4u"><input class="input grow svelte-1nhql4u" placeholder="Constraint label"/></div></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Type</div> <select class="input svelte-1nhql4u"></select></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Position</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2196 Raycast Pick</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <button class="btn btn-apply svelte-1nhql4u">\u2713 Apply Changes</button> <!> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Nudge (1 unit)</div> <div class="nudge-grid svelte-1nhql4u"><button class="btn btn-nudge x svelte-1nhql4u">\u2212X</button> <button class="btn btn-nudge x svelte-1nhql4u">+X</button> <button class="btn btn-nudge y svelte-1nhql4u">\u2212Y</button> <button class="btn btn-nudge y svelte-1nhql4u">+Y</button> <button class="btn btn-nudge z svelte-1nhql4u">\u2212Z</button> <button class="btn btn-nudge z svelte-1nhql4u">+Z</button></div></div> <!></div>`);
-  var root_50 = from_html(`<div class="empty-state svelte-1nhql4u"><div class="empty-icon svelte-1nhql4u">\u2B21</div> <div class="empty-msg svelte-1nhql4u">Select a constraint from the list</div> <div class="empty-sub svelte-1nhql4u">or press <kbd class="svelte-1nhql4u">A</kbd> to add one</div></div>`);
-  var root_52 = from_html(`<button><span class="theme-dot svelte-1nhql4u"></span> </button>`);
-  var root_51 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Visual Controls</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Visibility</div> <div class="toggle-list svelte-1nhql4u"><label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show all constraints</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Selected only</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show flow lines</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show labels</span></label></div></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="0.1" max="1" step="0.05"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="1" max="6" step="1"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Color Theme</div> <div class="theme-grid svelte-1nhql4u"></div></div></div>`);
-  var root_54 = from_html(`<div class="field-group svelte-1nhql4u"><div class="empty-inline svelte-1nhql4u">No saved positions yet.</div></div>`);
-  var root_56 = from_html(`<div class="pos-item svelte-1nhql4u"><div class="pos-name svelte-1nhql4u"> </div> <div class="pos-coords mono svelte-1nhql4u"> </div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2197 Apply to Selected</button> <button class="btn btn-xs btn-danger svelte-1nhql4u">\u2715</button></div></div>`);
-  var root_55 = from_html(`<div class="pos-list svelte-1nhql4u"></div>`);
-  var root_53 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Saved Positions</div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm svelte-1nhql4u">\u2295 Save Cursor</button> <button class="btn btn-sm svelte-1nhql4u">\u2295 Save Selected</button></div> <!></div>`);
-  var root_58 = from_html(`<span class="dirty svelte-1nhql4u">\u25CF unsaved</span>`);
-  var root_57 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Import / Export</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Auto Map Import</div> <textarea class="json-area mono svelte-1nhql4u" rows="3" placeholder="Paste JSON map string here for window.global.importMap(...) (Enter to run, Shift+Enter for newline)\u2026"></textarea> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u21BB Run window.global.importMap(json)</button></div></div> <div class="io-actions svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u2193 Export JSON</button> <button> </button> <button class="btn btn-sm svelte-1nhql4u">\u2191 Load from Text</button> <label class="btn btn-sm btn-file svelte-1nhql4u" title="Import from .json file">\u2295 Import File <input type="file" accept="application/json,.json" class="svelte-1nhql4u"/></label> <button class="btn btn-sm btn-danger svelte-1nhql4u">\u2715 Clear All</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JSON</div> <textarea class="json-area mono svelte-1nhql4u" placeholder="Paste JSON here to load, or copy/export to populate\u2026"></textarea></div> <div class="io-meta svelte-1nhql4u"><span class="svelte-1nhql4u"> </span> <span class="svelte-1nhql4u">\xB7</span> <span class="svelte-1nhql4u"> </span> <!></div></div>`);
-  var root = from_html(`<div class="shell svelte-1nhql4u"><aside class="rail svelte-1nhql4u"><div class="rail-head svelte-1nhql4u"><div class="rail-head-top svelte-1nhql4u"><span class="logo-mark svelte-1nhql4u">\u2B21</span> <span class="logo-text svelte-1nhql4u">CONSTRAINT RACK</span> <button class="close-btn svelte-1nhql4u" title="Close (Esc)">\u2715</button></div> <div class="map-badge svelte-1nhql4u"><span></span> <span class="map-name svelte-1nhql4u"> </span> <span class="map-mode svelte-1nhql4u"> </span></div></div> <div class="rail-toolbar svelte-1nhql4u"><div class="add-row svelte-1nhql4u"><select class="type-select svelte-1nhql4u"></select> <button class="btn btn-add svelte-1nhql4u" title="Add constraint (A)">+ Add</button></div> <button title="Click map to place (Esc to cancel)"><!></button> <input class="search-input svelte-1nhql4u" placeholder="Filter constraints\u2026"/></div> <div class="stats-bar svelte-1nhql4u"><span class="stat svelte-1nhql4u"> </span> <span class="stat stat-on svelte-1nhql4u"> </span> <!></div> <div class="clist svelte-1nhql4u"><!> <!> <div class="drop-zone svelte-1nhql4u" role="button" tabindex="-1">\u2193 drop to move to end</div></div></aside> <section class="main svelte-1nhql4u"><nav class="tabs svelte-1nhql4u"><!> <div class="tabs-spacer svelte-1nhql4u"></div> <div class="undo-redo svelte-1nhql4u"><button class="btn btn-icon svelte-1nhql4u" title="Undo (Ctrl+Z)">\u21A9</button> <button class="btn btn-icon svelte-1nhql4u" title="Redo (Ctrl+Y)">\u21AA</button></div></nav> <div class="tab-body svelte-1nhql4u"><!> <!> <!> <!></div></section></div>`);
+  var root_14 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Type</div> <select class="input svelte-1nhql4u"></select></div>`);
+  var root_16 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Position</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2196 Raycast Pick</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
+  var root_17 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Direction Normal</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
+  var root_19 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_20 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_21 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_22 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_18 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Hitbox</div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`);
+  var root_24 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_26 = from_html(`<div class="dim-note svelte-1nhql4u">Airborne box uses start/end as opposite corners.</div>`);
+  var root_27 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_28 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">thickness radius</span></div>`);
+  var root_23 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment Start</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Start</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment End</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick End</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
+  var root_29 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Jump Physics</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0.001"/> <span class="dim-note svelte-1nhql4u">jump y-vel</span></div></div>`);
+  var root_31 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_32 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_33 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_34 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_35 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Click to lock in`, 1);
+  var root_37 = from_html(`<button class="btn btn-xs btn-danger svelte-1nhql4u">Clear</button>`);
+  var root_38 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div></div>`);
+  var root_39 = from_html(`<div class="dim-note svelte-1nhql4u">No sample \u2014 arc starts from takeoff zone center.</div>`);
+  var root_40 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_41 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_42 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_43 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_30 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Takeoff</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Takeoff</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Takeoff Sample</div> <div class="field-actions svelte-1nhql4u"><button><!></button> <!></div></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Landing</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Landing</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
+  var root_45 = from_html(`<div class="dim-note svelte-1nhql4u">No nodes yet. Click "+ Node" or press T and click the map.</div>`);
+  var root_50 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_51 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_52 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_53 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">W</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">H</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">D</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_54 = from_html(`<div class="train-arc-params svelte-1nhql4u"><span class="train-arc-label svelte-1nhql4u"></span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0.001"/></div>`);
+  var root_46 = from_html(`<div class="train-node-block svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label train-node-label svelte-1nhql4u"><!></div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-danger svelte-1nhql4u">Del</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <!>`, 1);
+  var root_44 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">+ Node</button></div></div> <!> <!></div>`);
+  var root_55 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
+  var root_56 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Range</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Yaw Min</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Yaw Max</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
+  var root_57 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Velocity Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Target Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
+  var root_58 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Speed Window</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Max Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
+  var root_59 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Turn Constraint</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">max delta rad</span></div></div>`);
+  var root_61 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_60 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Required State</div> <select class="input svelte-1nhql4u"></select></div>`);
+  var root_62 = from_html(`<div class="cursor-info svelte-1nhql4u"><span class="cursor-label svelte-1nhql4u">Cursor hit</span> <span class="cursor-coords mono svelte-1nhql4u"> </span></div>`);
+  var root_64 = from_html(`<span class="readout-item svelte-1nhql4u">bx <b class="svelte-1nhql4u"> </b></span>`);
+  var root_63 = from_html(`<div class="readout svelte-1nhql4u"><span class="readout-item svelte-1nhql4u">cx <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cy <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cz <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">r <b class="svelte-1nhql4u"> </b></span> <!></div>`);
+  var root_13 = from_html(`<div class="pane svelte-1nhql4u"><div class="constraint-titlebar svelte-1nhql4u"><span class="ct-icon svelte-1nhql4u"> </span> <span class="ct-type svelte-1nhql4u"> </span> <span class="ct-spacer svelte-1nhql4u"></span> <button> </button> <button class="btn btn-sm svelte-1nhql4u" title="Duplicate (Ctrl+D)">\u29C9 Dupe</button> <button class="btn btn-danger btn-sm svelte-1nhql4u" title="Delete (Del)">\u2715 Del</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Label</div> <div class="row gap-8 svelte-1nhql4u"><input class="input grow svelte-1nhql4u" placeholder="Constraint label"/></div></div> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <button class="btn btn-apply svelte-1nhql4u">\u2713 Apply Changes</button> <!> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Nudge (1 unit)</div> <div class="nudge-grid svelte-1nhql4u"><button class="btn btn-nudge x svelte-1nhql4u">\u2212X</button> <button class="btn btn-nudge x svelte-1nhql4u">+X</button> <button class="btn btn-nudge y svelte-1nhql4u">\u2212Y</button> <button class="btn btn-nudge y svelte-1nhql4u">+Y</button> <button class="btn btn-nudge z svelte-1nhql4u">\u2212Z</button> <button class="btn btn-nudge z svelte-1nhql4u">+Z</button></div></div> <!></div>`);
+  var root_65 = from_html(`<div class="empty-state svelte-1nhql4u"><div class="empty-icon svelte-1nhql4u">\u2B21</div> <div class="empty-msg svelte-1nhql4u">Select a constraint from the list</div> <div class="empty-sub svelte-1nhql4u">or press <kbd class="svelte-1nhql4u">A</kbd> to add one</div></div>`);
+  var root_67 = from_html(`<button><span class="theme-dot svelte-1nhql4u"></span> </button>`);
+  var root_66 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Visual Controls</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Visibility</div> <div class="toggle-list svelte-1nhql4u"><label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show all constraints</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Selected only</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show flow lines</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show labels</span></label></div></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="0.1" max="1" step="0.05"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="1" max="6" step="1"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Color Theme</div> <div class="theme-grid svelte-1nhql4u"></div></div></div>`);
+  var root_69 = from_html(`<div class="field-group svelte-1nhql4u"><div class="empty-inline svelte-1nhql4u">No saved positions yet.</div></div>`);
+  var root_71 = from_html(`<div class="pos-item svelte-1nhql4u"><div class="pos-name svelte-1nhql4u"> </div> <div class="pos-coords mono svelte-1nhql4u"> </div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2197 Apply to Selected</button> <button class="btn btn-xs btn-danger svelte-1nhql4u">\u2715</button></div></div>`);
+  var root_70 = from_html(`<div class="pos-list svelte-1nhql4u"></div>`);
+  var root_68 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Saved Positions</div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm svelte-1nhql4u">\u2295 Save Cursor</button> <button class="btn btn-sm svelte-1nhql4u">\u2295 Save Selected</button></div> <!></div>`);
+  var root_73 = from_html(`<span class="dirty svelte-1nhql4u">\u25CF unsaved</span>`);
+  var root_72 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Import / Export</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Auto Map Import</div> <textarea class="json-area mono svelte-1nhql4u" rows="3" placeholder="Paste JSON map string here for window.global.importMap(...) (Enter to run, Shift+Enter for newline)\u2026"></textarea> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u21BB Run window.global.importMap(json)</button></div></div> <div class="io-actions svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u2193 Export JSON</button> <button> </button> <button class="btn btn-sm svelte-1nhql4u">\u2191 Load from Text</button> <label class="btn btn-sm btn-file svelte-1nhql4u" title="Import from .json file">\u2295 Import File <input type="file" accept="application/json,.json" class="svelte-1nhql4u"/></label> <button class="btn btn-sm btn-danger svelte-1nhql4u">\u2715 Clear All</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JSON</div> <textarea class="json-area mono svelte-1nhql4u" placeholder="Paste JSON here to load, or copy/export to populate\u2026"></textarea></div> <div class="io-meta svelte-1nhql4u"><span class="svelte-1nhql4u"> </span> <span class="svelte-1nhql4u">\xB7</span> <span class="svelte-1nhql4u"> </span> <!></div></div>`);
+  var root = from_html(`<div class="shell svelte-1nhql4u"><aside class="rail svelte-1nhql4u"><div class="rail-head svelte-1nhql4u"><div class="rail-head-top svelte-1nhql4u"><span class="logo-mark svelte-1nhql4u">\u2B21</span> <span class="logo-text svelte-1nhql4u">CONSTRAINT RACK</span> <button class="close-btn svelte-1nhql4u" title="Close (Esc)">\u2715</button></div> <div class="map-badge svelte-1nhql4u"><span></span> <span class="map-name svelte-1nhql4u"> </span> <span class="map-mode svelte-1nhql4u"> </span></div></div> <div class="rail-toolbar svelte-1nhql4u"><div class="add-row svelte-1nhql4u"><select class="type-select svelte-1nhql4u"></select> <button class="btn btn-add svelte-1nhql4u" title="Add constraint (A)">+ Add</button></div> <button title="Start Jump Train \u2014 click nodes on map (Enter/Esc to finish)"><!></button> <button title="Click map to place (Esc to cancel)"><!></button> <input class="search-input svelte-1nhql4u" placeholder="Filter constraints\u2026"/></div> <div class="stats-bar svelte-1nhql4u"><span class="stat svelte-1nhql4u"> </span> <span class="stat stat-on svelte-1nhql4u"> </span> <!></div> <div class="clist svelte-1nhql4u"><!> <!> <div class="drop-zone svelte-1nhql4u" role="button" tabindex="-1">\u2193 drop to move to end</div></div></aside> <section class="main svelte-1nhql4u"><nav class="tabs svelte-1nhql4u"><!> <div class="tabs-spacer svelte-1nhql4u"></div> <div class="undo-redo svelte-1nhql4u"><button class="btn btn-icon svelte-1nhql4u" title="Undo (Ctrl+Z)">\u21A9</button> <button class="btn btn-icon svelte-1nhql4u" title="Redo (Ctrl+Y)">\u21AA</button></div></nav> <div class="tab-body svelte-1nhql4u"><!> <!> <!> <!></div></section></div>`);
   var $$css = {
     hash: "svelte-1nhql4u",
-    code: '\n    /* \u2500\u2500 Reset & tokens \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */:root {--bg0: #0d1117;--bg1: #161b22;--bg2: #1c2128;--bg3: #252b33;--bg4: #2d333b;--border: #30363d;--text1: #e6edf3;--text2: #8b949e;--text3: #6e7681;--accent: #58a6ff;--green: #3fb950;--red: #f85149;--yellow: #d29922;--radius: 6px;}.shell.svelte-1nhql4u {position:absolute;inset:0;display:flex;flex-direction:row;overflow:hidden;background:var(--bg0);color:var(--text1);font:13px/1.5 "Inter",\n            "Segoe UI",\n            system-ui,\n            sans-serif;pointer-events:auto;}.shell.svelte-1nhql4u :where(.svelte-1nhql4u) {box-sizing:border-box;font-family:inherit;color:var(--text1);outline:none;}\n\n    /* \u2500\u2500 Rail \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */.rail.svelte-1nhql4u {width:320px;min-width:320px;max-width:320px;background:var(--bg1);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;}.rail-head.svelte-1nhql4u {background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 14px 10px;}.rail-head-top.svelte-1nhql4u {display:flex;align-items:center;gap:8px;margin-bottom:8px;}.logo-mark.svelte-1nhql4u {font-size:18px;color:var(--accent);line-height:1;}.logo-text.svelte-1nhql4u {font-size:11px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:var(--text1);flex:1;}.close-btn.svelte-1nhql4u {background:none;border:none;color:var(--text3);font-size:14px;cursor:pointer;padding:2px 6px;border-radius:4px;}.close-btn.svelte-1nhql4u:hover {background:var(--bg4);color:var(--text1);}.map-badge.svelte-1nhql4u {display:flex;align-items:center;gap:7px;}.map-dot.svelte-1nhql4u {width:7px;height:7px;border-radius:50%;background:var(--text3);flex-shrink:0;}.map-dot.ready.svelte-1nhql4u {background:var(--green);}.map-name.svelte-1nhql4u {font-size:12px;font-family:ui-monospace, "Cascadia Code", monospace;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.map-mode.svelte-1nhql4u {font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--yellow);background:#26200b;border:1px solid #443800;border-radius:3px;padding:1px 6px;}\n\n    /* Toolbar */.rail-toolbar.svelte-1nhql4u {border-bottom:1px solid var(--border);padding:10px 12px;display:grid;gap:8px;background:var(--bg1);}.add-row.svelte-1nhql4u {display:flex;gap:8px;}\n\n    /* Stats bar */.stats-bar.svelte-1nhql4u {display:flex;gap:0;background:var(--bg2);border-bottom:1px solid var(--border);padding:4px 12px;font-size:11px;gap:10px;}.stat.svelte-1nhql4u {color:var(--text2);}.stat-on.svelte-1nhql4u {color:var(--green);}.stat-off.svelte-1nhql4u {color:var(--red);}\n\n    /* Constraint list */.clist.svelte-1nhql4u {flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:4px;min-height:0;}.clist-empty.svelte-1nhql4u {padding:20px;text-align:center;color:var(--text3);font-size:12px;}.citem.svelte-1nhql4u {position:relative;display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);color:var(--text1);padding:7px 10px 7px 4px;text-align:left;cursor:pointer;overflow:hidden;transition:background 0.1s,\n            border-color 0.1s;}.citem.svelte-1nhql4u:hover {background:var(--bg3);border-color:#484f58;}.citem.selected.svelte-1nhql4u {background:var(--bg3);border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset,\n            0 0 8px rgba(88, 166, 255, 0.1);}.citem.disabled.svelte-1nhql4u {opacity:0.5;}.citem.dragover.svelte-1nhql4u {border-color:var(--yellow);box-shadow:0 0 0 1px var(--yellow) inset;}\n\n    /* Left accent stripe */.citem-accent.svelte-1nhql4u {position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--tc, #8b949e);border-radius:var(--radius) 0 0 var(--radius);}.citem-num.svelte-1nhql4u {width:22px;text-align:right;font-size:11px;color:var(--text3);font-variant-numeric:tabular-nums;flex-shrink:0;padding-left:8px;}.citem-icon.svelte-1nhql4u {font-size:14px;flex-shrink:0;width:18px;text-align:center;}.citem-body.svelte-1nhql4u {flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;}.citem-label.svelte-1nhql4u {font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.citem-type.svelte-1nhql4u {font-size:10px;color:var(--text3);font-family:ui-monospace, monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.citem-badge.svelte-1nhql4u {font-size:9px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;border-radius:3px;padding:2px 5px;flex-shrink:0;}.citem-badge.off.svelte-1nhql4u {background:#3d1a1a;color:var(--red);border:1px solid #5a2222;}.citem-badge.sel.svelte-1nhql4u {background:#0d2044;color:var(--accent);border:1px solid #1a3a6e;}.citem-handle.svelte-1nhql4u {font-size:14px;color:var(--text3);cursor:grab;flex-shrink:0;letter-spacing:-2px;}.drop-zone.svelte-1nhql4u {border:1px dashed #30363d;border-radius:var(--radius);color:var(--text3);padding:7px;text-align:center;font-size:11px;cursor:default;}\n\n    /* \u2500\u2500 Main panel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */.main.svelte-1nhql4u {flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:var(--bg0);}\n\n    /* Tab bar */.tabs.svelte-1nhql4u {display:flex;align-items:center;border-bottom:1px solid var(--border);background:var(--bg1);padding:0 12px;gap:2px;}.tab.svelte-1nhql4u {background:none;border:none;border-bottom:2px solid transparent;color:var(--text2);padding:10px 14px;font-size:13px;font-weight:500;cursor:pointer;margin-bottom:-1px;transition:color 0.1s,\n            border-color 0.1s;}.tab.svelte-1nhql4u:hover {color:var(--text1);}.tab.active.svelte-1nhql4u {color:var(--text1);border-bottom-color:var(--accent);}.tabs-spacer.svelte-1nhql4u {flex:1;}.undo-redo.svelte-1nhql4u {display:flex;gap:4px;}\n\n    /* Tab body */.tab-body.svelte-1nhql4u {flex:1;overflow-y:auto;overflow-x:hidden;padding:16px;min-height:0;width:100%;}.pane.svelte-1nhql4u {display:flex;flex-direction:column;gap:14px;width:100%;max-width:100%;}.pane-title.svelte-1nhql4u {font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.4px;color:var(--text2);padding-bottom:4px;border-bottom:1px solid var(--border);}\n\n    /* Constraint title bar */.constraint-titlebar.svelte-1nhql4u {display:flex;align-items:center;gap:8px;background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--tc, #8b949e);border-radius:var(--radius);padding:8px 10px;}.ct-icon.svelte-1nhql4u {font-size:16px;color:var(--tc, #8b949e);}.ct-type.svelte-1nhql4u {font-size:12px;font-weight:700;font-family:ui-monospace, monospace;color:var(--text1);}.ct-spacer.svelte-1nhql4u {flex:1;}\n\n    /* Field groups */.field-group.svelte-1nhql4u {display:flex;flex-direction:column;gap:6px;}.field-label.svelte-1nhql4u {font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--text2);}.field-row-header.svelte-1nhql4u {display:flex;align-items:center;justify-content:space-between;gap:8px;}.field-actions.svelte-1nhql4u {display:flex;gap:6px;}\n\n    /* XYZ grid */.xyz-grid.svelte-1nhql4u {display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;}.xyz-field.svelte-1nhql4u {display:flex;flex-direction:column;gap:4px;}.xyz-axis.svelte-1nhql4u {font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;}.xyz-axis.x.svelte-1nhql4u {color:#f85149;}.xyz-axis.y.svelte-1nhql4u {color:#3fb950;}.xyz-axis.z.svelte-1nhql4u {color:#58a6ff;}\n\n    /* Inputs */.input.svelte-1nhql4u {width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 10px;font-size:13px;transition:border-color 0.15s,\n            box-shadow 0.15s;}.input.svelte-1nhql4u:focus {border-color:var(--accent);box-shadow:0 0 0 3px rgba(88, 166, 255, 0.15);}.input.svelte-1nhql4u::placeholder {color:var(--text3);}.input[type="number"].svelte-1nhql4u {-moz-appearance:textfield;}.input[type="number"].svelte-1nhql4u::-webkit-outer-spin-button,\n    .input[type="number"].svelte-1nhql4u::-webkit-inner-spin-button {-webkit-appearance:none;margin:0;}.mono.svelte-1nhql4u {font-family:ui-monospace, "Cascadia Code", monospace;}\n\n    /* Apply button */.btn-apply.svelte-1nhql4u {background:var(--accent);border:1px solid rgba(88, 166, 255, 0.4);color:#0d1117;font-weight:700;font-size:13px;padding:9px 18px;border-radius:var(--radius);cursor:pointer;transition:background 0.15s,\n            transform 0.1s;}.btn-apply.svelte-1nhql4u:hover {background:#79c0ff;}.btn-apply.svelte-1nhql4u:active {transform:scale(0.98);}\n\n    /* Nudge */.nudge-grid.svelte-1nhql4u {display:grid;grid-template-columns:repeat(6, 1fr);gap:5px;}.btn-nudge.svelte-1nhql4u {background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text1);font-size:12px;font-weight:600;padding:6px 4px;cursor:pointer;text-align:center;transition:background 0.1s;}.btn-nudge.x.svelte-1nhql4u {border-bottom:2px solid #f85149;}.btn-nudge.y.svelte-1nhql4u {border-bottom:2px solid #3fb950;}.btn-nudge.z.svelte-1nhql4u {border-bottom:2px solid #58a6ff;}.btn-nudge.svelte-1nhql4u:hover {background:var(--bg4);}\n\n    /* Readout */.readout.svelte-1nhql4u {display:flex;gap:10px;font-size:11px;color:var(--text2);background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;font-family:ui-monospace, monospace;}.readout-item.svelte-1nhql4u b:where(.svelte-1nhql4u) {color:var(--text1);}\n\n    /* Cursor info */.cursor-info.svelte-1nhql4u {display:flex;align-items:center;gap:10px;font-size:11px;background:#0d2044;border:1px solid #1a3a6e;border-radius:var(--radius);padding:6px 10px;}.cursor-label.svelte-1nhql4u {color:var(--accent);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:0.6px;}.cursor-coords.svelte-1nhql4u {color:var(--text2);}\n\n    /* Dim note */.dim-note.svelte-1nhql4u {font-size:11px;color:var(--text3);white-space:nowrap;}\n\n    /* Empty state */.empty-state.svelte-1nhql4u {display:flex;flex-direction:column;align-items:center;justify-content:center;height:280px;gap:8px;color:var(--text3);}.empty-icon.svelte-1nhql4u {font-size:36px;opacity:0.3;}.empty-msg.svelte-1nhql4u {font-size:14px;font-weight:600;color:var(--text2);}.empty-sub.svelte-1nhql4u {font-size:12px;}.empty-sub.svelte-1nhql4u kbd:where(.svelte-1nhql4u) {background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;font-family:inherit;color:var(--text1);}.empty-inline.svelte-1nhql4u {color:var(--text3);font-size:12px;padding:8px 0;}\n\n    /* Visuals tab */.toggle-list.svelte-1nhql4u {display:flex;flex-direction:column;gap:8px;}.toggle-row.svelte-1nhql4u {display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;color:var(--text1);user-select:none;}.toggle-row.svelte-1nhql4u input:where(.svelte-1nhql4u) {display:none;}.toggle-track.svelte-1nhql4u {position:relative;width:34px;height:18px;background:var(--bg4);border:1px solid var(--border);border-radius:9px;flex-shrink:0;transition:background 0.15s,\n            border-color 0.15s;}.toggle-track.svelte-1nhql4u::after {content:"";position:absolute;left:2px;top:50%;transform:translateY(-50%);width:12px;height:12px;border-radius:50%;background:var(--text3);transition:left 0.15s,\n            background 0.15s;}.toggle-row.svelte-1nhql4u input:where(.svelte-1nhql4u):checked ~ .toggle-track:where(.svelte-1nhql4u) {background:#0d3a1c;border-color:var(--green);}.toggle-row.svelte-1nhql4u input:where(.svelte-1nhql4u):checked ~ .toggle-track:where(.svelte-1nhql4u)::after {left:18px;background:var(--green);}.slider.svelte-1nhql4u {-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--bg4);border:1px solid var(--border);border-radius:2px;outline:none;cursor:pointer;}.slider.svelte-1nhql4u::-webkit-slider-thumb {-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--accent);border:2px solid var(--bg0);cursor:pointer;}.theme-grid.svelte-1nhql4u {display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;}.theme-btn.svelte-1nhql4u {display:flex;align-items:center;gap:7px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:8px 10px;cursor:pointer;font-size:13px;font-weight:500;transition:border-color 0.1s,\n            background 0.1s;}.theme-btn.svelte-1nhql4u:hover {background:var(--bg3);}.theme-btn.active.svelte-1nhql4u {border-color:var(--accent);background:var(--bg3);}.theme-dot.svelte-1nhql4u {width:10px;height:10px;border-radius:50%;flex-shrink:0;}\n\n    /* Positions tab */.pos-list.svelte-1nhql4u {display:flex;flex-direction:column;gap:8px;}.pos-item.svelte-1nhql4u {background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;display:flex;flex-direction:column;gap:5px;}.pos-name.svelte-1nhql4u {font-size:13px;font-weight:600;}.pos-coords.svelte-1nhql4u {font-size:12px;color:var(--text2);}\n\n    /* I/O tab */.io-actions.svelte-1nhql4u {display:flex;flex-wrap:wrap;gap:8px;}.btn-file.svelte-1nhql4u {position:relative;overflow:hidden;}.btn-file.svelte-1nhql4u input:where(.svelte-1nhql4u) {position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0;}.json-area.svelte-1nhql4u {width:100%;min-height:200px;resize:vertical;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:10px 12px;font-family:ui-monospace, "Cascadia Code", monospace;font-size:12px;line-height:1.6;transition:border-color 0.15s;}.json-area.svelte-1nhql4u:focus {border-color:var(--accent);outline:none;}.json-area.svelte-1nhql4u::placeholder {color:var(--text3);}.io-meta.svelte-1nhql4u {display:flex;gap:8px;font-size:11px;color:var(--text3);}.dirty.svelte-1nhql4u {color:var(--yellow);}\n\n    /* \u2500\u2500 Generic buttons \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */.btn.svelte-1nhql4u {display:inline-flex;align-items:center;justify-content:center;gap:5px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 12px;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background 0.1s,\n            border-color 0.1s;}.btn.svelte-1nhql4u:hover {background:var(--bg4);border-color:#484f58;}.btn-sm.svelte-1nhql4u {padding:5px 10px;font-size:12px;}.btn-xs.svelte-1nhql4u {padding:3px 8px;font-size:11px;}.btn-icon.svelte-1nhql4u {padding:5px 10px;font-size:14px;background:none;border-color:transparent;}.btn-icon.svelte-1nhql4u:hover {background:var(--bg3);border-color:var(--border);}.btn-add.svelte-1nhql4u {background:#0d3a1c;border-color:#1a5c2c;color:var(--green);font-weight:700;}.btn-add.svelte-1nhql4u:hover {background:#133f21;}.btn-accent.svelte-1nhql4u {background:#0d2044;border-color:#1a3a6e;color:var(--accent);}.btn-accent.svelte-1nhql4u:hover {background:#122850;}.btn-armed.svelte-1nhql4u {background:#261a0d;border-color:#6e3d00;color:var(--yellow);}.btn-armed.svelte-1nhql4u:hover {background:#2f2010;}.btn-danger.svelte-1nhql4u {background:#3d1a1a;border-color:#5a2222;color:var(--red);}.btn-danger.svelte-1nhql4u:hover {background:#4a2020;}.btn-toggle.svelte-1nhql4u {font-size:11px;font-weight:700;letter-spacing:0.6px;padding:4px 10px;}.btn-toggle.enabled.svelte-1nhql4u {background:#0d3a1c;border-color:#1a5c2c;color:var(--green);}.btn-toggle.svelte-1nhql4u:not(.enabled) {background:#3d1a1a;border-color:#5a2222;color:var(--red);}.btn-raycast.svelte-1nhql4u {background:var(--bg2);border-color:var(--border);font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;justify-content:center;}.btn-raycast.armed.svelte-1nhql4u {background:#261a0d;border-color:#6e3d00;color:var(--yellow);\n        animation: svelte-1nhql4u-armed-pulse 1.5s ease-in-out infinite;}\n    @keyframes svelte-1nhql4u-armed-pulse {\n        0%,\n        100% {\n            box-shadow: 0 0 0 0 rgba(210, 153, 34, 0);\n        }\n        50% {\n            box-shadow: 0 0 0 4px rgba(210, 153, 34, 0.2);\n        }\n    }.pulse-dot.svelte-1nhql4u {width:8px;height:8px;background:var(--yellow);border-radius:50%;\n        animation: svelte-1nhql4u-dot-pulse 1s ease-in-out infinite;flex-shrink:0;}\n    @keyframes svelte-1nhql4u-dot-pulse {\n        0%,\n        100% {\n            opacity: 1;\n            transform: scale(1);\n        }\n        50% {\n            opacity: 0.5;\n            transform: scale(0.7);\n        }\n    }.type-select.svelte-1nhql4u {flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 10px;font-size:13px;cursor:pointer;}.type-select.svelte-1nhql4u:focus {border-color:var(--accent);}.search-input.svelte-1nhql4u {width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 10px;font-size:13px;}.search-input.svelte-1nhql4u:focus {border-color:var(--accent);outline:none;}.search-input.svelte-1nhql4u::placeholder {color:var(--text3);}.btn.feedback.svelte-1nhql4u {background:#0d3a1c;border-color:var(--green);color:var(--green);}\n\n    /* Utility */.row.svelte-1nhql4u {display:flex;}.gap-8.svelte-1nhql4u {gap:8px;}.align-center.svelte-1nhql4u {align-items:center;}.grow.svelte-1nhql4u {flex:1;min-width:0;}'
+    code: '\n    /* \u2500\u2500 Reset & tokens \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */:root {--bg0: #0d1117;--bg1: #161b22;--bg2: #1c2128;--bg3: #252b33;--bg4: #2d333b;--border: #30363d;--text1: #e6edf3;--text2: #8b949e;--text3: #6e7681;--accent: #58a6ff;--green: #3fb950;--red: #f85149;--yellow: #d29922;--radius: 6px;}.shell.svelte-1nhql4u {position:absolute;inset:0;display:flex;flex-direction:row;overflow:hidden;background:var(--bg0);color:var(--text1);font:13px/1.5 "Inter",\n            "Segoe UI",\n            system-ui,\n            sans-serif;pointer-events:auto;}.shell.svelte-1nhql4u :where(.svelte-1nhql4u) {box-sizing:border-box;font-family:inherit;color:var(--text1);outline:none;}\n\n    /* \u2500\u2500 Rail \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */.rail.svelte-1nhql4u {width:320px;min-width:320px;max-width:320px;background:var(--bg1);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;}.rail-head.svelte-1nhql4u {background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 14px 10px;}.rail-head-top.svelte-1nhql4u {display:flex;align-items:center;gap:8px;margin-bottom:8px;}.logo-mark.svelte-1nhql4u {font-size:18px;color:var(--accent);line-height:1;}.logo-text.svelte-1nhql4u {font-size:11px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:var(--text1);flex:1;}.close-btn.svelte-1nhql4u {background:none;border:none;color:var(--text3);font-size:14px;cursor:pointer;padding:2px 6px;border-radius:4px;}.close-btn.svelte-1nhql4u:hover {background:var(--bg4);color:var(--text1);}.map-badge.svelte-1nhql4u {display:flex;align-items:center;gap:7px;}.map-dot.svelte-1nhql4u {width:7px;height:7px;border-radius:50%;background:var(--text3);flex-shrink:0;}.map-dot.ready.svelte-1nhql4u {background:var(--green);}.map-name.svelte-1nhql4u {font-size:12px;font-family:ui-monospace, "Cascadia Code", monospace;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.map-mode.svelte-1nhql4u {font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--yellow);background:#26200b;border:1px solid #443800;border-radius:3px;padding:1px 6px;}\n\n    /* Toolbar */.rail-toolbar.svelte-1nhql4u {border-bottom:1px solid var(--border);padding:10px 12px;display:grid;gap:8px;background:var(--bg1);}.add-row.svelte-1nhql4u {display:flex;gap:8px;}\n\n    /* Stats bar */.stats-bar.svelte-1nhql4u {display:flex;gap:0;background:var(--bg2);border-bottom:1px solid var(--border);padding:4px 12px;font-size:11px;gap:10px;}.stat.svelte-1nhql4u {color:var(--text2);}.stat-on.svelte-1nhql4u {color:var(--green);}.stat-off.svelte-1nhql4u {color:var(--red);}\n\n    /* Constraint list */.clist.svelte-1nhql4u {flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:4px;min-height:0;}.clist-empty.svelte-1nhql4u {padding:20px;text-align:center;color:var(--text3);font-size:12px;}.citem.svelte-1nhql4u {position:relative;display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);color:var(--text1);padding:7px 10px 7px 4px;text-align:left;cursor:pointer;overflow:hidden;transition:background 0.1s,\n            border-color 0.1s;}.citem.svelte-1nhql4u:hover {background:var(--bg3);border-color:#484f58;}.citem.selected.svelte-1nhql4u {background:var(--bg3);border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset,\n            0 0 8px rgba(88, 166, 255, 0.1);}.citem.disabled.svelte-1nhql4u {opacity:0.5;}.citem.dragover.svelte-1nhql4u {border-color:var(--yellow);box-shadow:0 0 0 1px var(--yellow) inset;}.citem.train-child.svelte-1nhql4u {margin-left:18px;width:calc(100% - 18px);background:rgba(240, 136, 62, 0.06);border-style:dashed;}\n\n    /* Left accent stripe */.citem-accent.svelte-1nhql4u {position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--tc, #8b949e);border-radius:var(--radius) 0 0 var(--radius);}.citem-num.svelte-1nhql4u {width:22px;text-align:right;font-size:11px;color:var(--text3);font-variant-numeric:tabular-nums;flex-shrink:0;padding-left:8px;}.citem-icon.svelte-1nhql4u {font-size:14px;flex-shrink:0;width:18px;text-align:center;}.citem-body.svelte-1nhql4u {flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;}.citem-label.svelte-1nhql4u {font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.citem-type.svelte-1nhql4u {font-size:10px;color:var(--text3);font-family:ui-monospace, monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.citem-badge.svelte-1nhql4u {font-size:9px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;border-radius:3px;padding:2px 5px;flex-shrink:0;}.citem-badge.off.svelte-1nhql4u {background:#3d1a1a;color:var(--red);border:1px solid #5a2222;}.citem-badge.sel.svelte-1nhql4u {background:#0d2044;color:var(--accent);border:1px solid #1a3a6e;}.citem-handle.svelte-1nhql4u {font-size:14px;color:var(--text3);cursor:grab;flex-shrink:0;letter-spacing:-2px;}.drop-zone.svelte-1nhql4u {border:1px dashed #30363d;border-radius:var(--radius);color:var(--text3);padding:7px;text-align:center;font-size:11px;cursor:default;}\n\n    /* \u2500\u2500 Main panel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */.main.svelte-1nhql4u {flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:var(--bg0);}\n\n    /* Tab bar */.tabs.svelte-1nhql4u {display:flex;align-items:center;border-bottom:1px solid var(--border);background:var(--bg1);padding:0 12px;gap:2px;}.tab.svelte-1nhql4u {background:none;border:none;border-bottom:2px solid transparent;color:var(--text2);padding:10px 14px;font-size:13px;font-weight:500;cursor:pointer;margin-bottom:-1px;transition:color 0.1s,\n            border-color 0.1s;}.tab.svelte-1nhql4u:hover {color:var(--text1);}.tab.active.svelte-1nhql4u {color:var(--text1);border-bottom-color:var(--accent);}.tabs-spacer.svelte-1nhql4u {flex:1;}.undo-redo.svelte-1nhql4u {display:flex;gap:4px;}\n\n    /* Tab body */.tab-body.svelte-1nhql4u {flex:1;overflow-y:auto;overflow-x:hidden;padding:16px;min-height:0;width:100%;}.pane.svelte-1nhql4u {display:flex;flex-direction:column;gap:14px;width:100%;max-width:100%;}.pane-title.svelte-1nhql4u {font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.4px;color:var(--text2);padding-bottom:4px;border-bottom:1px solid var(--border);}\n\n    /* Constraint title bar */.constraint-titlebar.svelte-1nhql4u {display:flex;align-items:center;gap:8px;background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--tc, #8b949e);border-radius:var(--radius);padding:8px 10px;}.ct-icon.svelte-1nhql4u {font-size:16px;color:var(--tc, #8b949e);}.ct-type.svelte-1nhql4u {font-size:12px;font-weight:700;font-family:ui-monospace, monospace;color:var(--text1);}.ct-spacer.svelte-1nhql4u {flex:1;}\n\n    /* Field groups */.field-group.svelte-1nhql4u {display:flex;flex-direction:column;gap:6px;}.field-label.svelte-1nhql4u {font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;color:var(--text2);}.field-row-header.svelte-1nhql4u {display:flex;align-items:center;justify-content:space-between;gap:8px;}.field-actions.svelte-1nhql4u {display:flex;gap:6px;}\n\n    /* XYZ grid */.xyz-grid.svelte-1nhql4u {display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;}.xyz-field.svelte-1nhql4u {display:flex;flex-direction:column;gap:4px;}.xyz-axis.svelte-1nhql4u {font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;}.xyz-axis.x.svelte-1nhql4u {color:#f85149;}.xyz-axis.y.svelte-1nhql4u {color:#3fb950;}.xyz-axis.z.svelte-1nhql4u {color:#58a6ff;}\n\n    /* Inputs */.input.svelte-1nhql4u {width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 10px;font-size:13px;transition:border-color 0.15s,\n            box-shadow 0.15s;}.input.svelte-1nhql4u:focus {border-color:var(--accent);box-shadow:0 0 0 3px rgba(88, 166, 255, 0.15);}.input.svelte-1nhql4u::placeholder {color:var(--text3);}.input[type="number"].svelte-1nhql4u {-moz-appearance:textfield;}.input[type="number"].svelte-1nhql4u::-webkit-outer-spin-button,\n    .input[type="number"].svelte-1nhql4u::-webkit-inner-spin-button {-webkit-appearance:none;margin:0;}.mono.svelte-1nhql4u {font-family:ui-monospace, "Cascadia Code", monospace;}\n\n    /* Apply button */.btn-apply.svelte-1nhql4u {background:var(--accent);border:1px solid rgba(88, 166, 255, 0.4);color:#0d1117;font-weight:700;font-size:13px;padding:9px 18px;border-radius:var(--radius);cursor:pointer;transition:background 0.15s,\n            transform 0.1s;}.btn-apply.svelte-1nhql4u:hover {background:#79c0ff;}.btn-apply.svelte-1nhql4u:active {transform:scale(0.98);}\n\n    /* Nudge */.nudge-grid.svelte-1nhql4u {display:grid;grid-template-columns:repeat(6, 1fr);gap:5px;}.btn-nudge.svelte-1nhql4u {background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text1);font-size:12px;font-weight:600;padding:6px 4px;cursor:pointer;text-align:center;transition:background 0.1s;}.btn-nudge.x.svelte-1nhql4u {border-bottom:2px solid #f85149;}.btn-nudge.y.svelte-1nhql4u {border-bottom:2px solid #3fb950;}.btn-nudge.z.svelte-1nhql4u {border-bottom:2px solid #58a6ff;}.btn-nudge.svelte-1nhql4u:hover {background:var(--bg4);}\n\n    /* Readout */.readout.svelte-1nhql4u {display:flex;gap:10px;font-size:11px;color:var(--text2);background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;font-family:ui-monospace, monospace;}.readout-item.svelte-1nhql4u b:where(.svelte-1nhql4u) {color:var(--text1);}\n\n    /* Cursor info */.cursor-info.svelte-1nhql4u {display:flex;align-items:center;gap:10px;font-size:11px;background:#0d2044;border:1px solid #1a3a6e;border-radius:var(--radius);padding:6px 10px;}.cursor-label.svelte-1nhql4u {color:var(--accent);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:0.6px;}.cursor-coords.svelte-1nhql4u {color:var(--text2);}\n\n    /* Dim note */.dim-note.svelte-1nhql4u {font-size:11px;color:var(--text3);white-space:nowrap;}\n\n    /* Empty state */.empty-state.svelte-1nhql4u {display:flex;flex-direction:column;align-items:center;justify-content:center;height:280px;gap:8px;color:var(--text3);}.empty-icon.svelte-1nhql4u {font-size:36px;opacity:0.3;}.empty-msg.svelte-1nhql4u {font-size:14px;font-weight:600;color:var(--text2);}.empty-sub.svelte-1nhql4u {font-size:12px;}.empty-sub.svelte-1nhql4u kbd:where(.svelte-1nhql4u) {background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;font-family:inherit;color:var(--text1);}.empty-inline.svelte-1nhql4u {color:var(--text3);font-size:12px;padding:8px 0;}\n\n    /* Visuals tab */.toggle-list.svelte-1nhql4u {display:flex;flex-direction:column;gap:8px;}.toggle-row.svelte-1nhql4u {display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;color:var(--text1);user-select:none;}.toggle-row.svelte-1nhql4u input:where(.svelte-1nhql4u) {display:none;}.toggle-track.svelte-1nhql4u {position:relative;width:34px;height:18px;background:var(--bg4);border:1px solid var(--border);border-radius:9px;flex-shrink:0;transition:background 0.15s,\n            border-color 0.15s;}.toggle-track.svelte-1nhql4u::after {content:"";position:absolute;left:2px;top:50%;transform:translateY(-50%);width:12px;height:12px;border-radius:50%;background:var(--text3);transition:left 0.15s,\n            background 0.15s;}.toggle-row.svelte-1nhql4u input:where(.svelte-1nhql4u):checked ~ .toggle-track:where(.svelte-1nhql4u) {background:#0d3a1c;border-color:var(--green);}.toggle-row.svelte-1nhql4u input:where(.svelte-1nhql4u):checked ~ .toggle-track:where(.svelte-1nhql4u)::after {left:18px;background:var(--green);}.slider.svelte-1nhql4u {-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--bg4);border:1px solid var(--border);border-radius:2px;outline:none;cursor:pointer;}.slider.svelte-1nhql4u::-webkit-slider-thumb {-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--accent);border:2px solid var(--bg0);cursor:pointer;}.theme-grid.svelte-1nhql4u {display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;}.theme-btn.svelte-1nhql4u {display:flex;align-items:center;gap:7px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:8px 10px;cursor:pointer;font-size:13px;font-weight:500;transition:border-color 0.1s,\n            background 0.1s;}.theme-btn.svelte-1nhql4u:hover {background:var(--bg3);}.theme-btn.active.svelte-1nhql4u {border-color:var(--accent);background:var(--bg3);}.theme-dot.svelte-1nhql4u {width:10px;height:10px;border-radius:50%;flex-shrink:0;}\n\n    /* Positions tab */.pos-list.svelte-1nhql4u {display:flex;flex-direction:column;gap:8px;}.pos-item.svelte-1nhql4u {background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;display:flex;flex-direction:column;gap:5px;}.pos-name.svelte-1nhql4u {font-size:13px;font-weight:600;}.pos-coords.svelte-1nhql4u {font-size:12px;color:var(--text2);}\n\n    /* I/O tab */.io-actions.svelte-1nhql4u {display:flex;flex-wrap:wrap;gap:8px;}.btn-file.svelte-1nhql4u {position:relative;overflow:hidden;}.btn-file.svelte-1nhql4u input:where(.svelte-1nhql4u) {position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0;}.json-area.svelte-1nhql4u {width:100%;min-height:200px;resize:vertical;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:10px 12px;font-family:ui-monospace, "Cascadia Code", monospace;font-size:12px;line-height:1.6;transition:border-color 0.15s;}.json-area.svelte-1nhql4u:focus {border-color:var(--accent);outline:none;}.json-area.svelte-1nhql4u::placeholder {color:var(--text3);}.io-meta.svelte-1nhql4u {display:flex;gap:8px;font-size:11px;color:var(--text3);}.dirty.svelte-1nhql4u {color:var(--yellow);}\n\n    /* \u2500\u2500 Generic buttons \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */.btn.svelte-1nhql4u {display:inline-flex;align-items:center;justify-content:center;gap:5px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 12px;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background 0.1s,\n            border-color 0.1s;}.btn.svelte-1nhql4u:hover {background:var(--bg4);border-color:#484f58;}.btn-sm.svelte-1nhql4u {padding:5px 10px;font-size:12px;}.btn-xs.svelte-1nhql4u {padding:3px 8px;font-size:11px;}.btn-icon.svelte-1nhql4u {padding:5px 10px;font-size:14px;background:none;border-color:transparent;}.btn-icon.svelte-1nhql4u:hover {background:var(--bg3);border-color:var(--border);}.btn-add.svelte-1nhql4u {background:#0d3a1c;border-color:#1a5c2c;color:var(--green);font-weight:700;}.btn-add.svelte-1nhql4u:hover {background:#133f21;}.btn-accent.svelte-1nhql4u {background:#0d2044;border-color:#1a3a6e;color:var(--accent);}.btn-accent.svelte-1nhql4u:hover {background:#122850;}.btn-armed.svelte-1nhql4u {background:#261a0d;border-color:#6e3d00;color:var(--yellow);}.btn-armed.svelte-1nhql4u:hover {background:#2f2010;}.btn-danger.svelte-1nhql4u {background:#3d1a1a;border-color:#5a2222;color:var(--red);}.btn-danger.svelte-1nhql4u:hover {background:#4a2020;}.btn-toggle.svelte-1nhql4u {font-size:11px;font-weight:700;letter-spacing:0.6px;padding:4px 10px;}.btn-toggle.enabled.svelte-1nhql4u {background:#0d3a1c;border-color:#1a5c2c;color:var(--green);}.btn-toggle.svelte-1nhql4u:not(.enabled) {background:#3d1a1a;border-color:#5a2222;color:var(--red);}.btn-raycast.svelte-1nhql4u {background:var(--bg2);border-color:var(--border);font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;justify-content:center;}.btn-raycast.armed.svelte-1nhql4u {background:#261a0d;border-color:#6e3d00;color:var(--yellow);\n        animation: svelte-1nhql4u-armed-pulse 1.5s ease-in-out infinite;}.btn-train.svelte-1nhql4u {background:var(--bg2);border-color:var(--border);font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;justify-content:center;color:#ff9933;}.btn-train.armed.svelte-1nhql4u {background:#261500;border-color:#7a4400;color:#ffbb55;\n        animation: svelte-1nhql4u-armed-pulse 1.5s ease-in-out infinite;}.train-node-block.svelte-1nhql4u {margin:6px 0;padding:8px;background:rgba(255, 153, 51, 0.07);border:1px solid rgba(255, 153, 51, 0.2);border-radius:5px;display:flex;flex-direction:column;gap:6px;}.train-node-label.svelte-1nhql4u {font-size:11px;color:#ff9933;font-weight:600;}.train-arc-params.svelte-1nhql4u {display:flex;align-items:center;gap:8px;padding:4px 8px;background:rgba(255, 153, 51, 0.04);border-left:2px solid rgba(255, 153, 51, 0.3);border-radius:0 4px 4px 0;margin:2px 0 4px 0;}.train-arc-label.svelte-1nhql4u {font-size:10px;color:#8b949e;white-space:nowrap;flex-shrink:0;}\n    @keyframes svelte-1nhql4u-armed-pulse {\n        0%,\n        100% {\n            box-shadow: 0 0 0 0 rgba(210, 153, 34, 0);\n        }\n        50% {\n            box-shadow: 0 0 0 4px rgba(210, 153, 34, 0.2);\n        }\n    }.pulse-dot.svelte-1nhql4u {width:8px;height:8px;background:var(--yellow);border-radius:50%;\n        animation: svelte-1nhql4u-dot-pulse 1s ease-in-out infinite;flex-shrink:0;}\n    @keyframes svelte-1nhql4u-dot-pulse {\n        0%,\n        100% {\n            opacity: 1;\n            transform: scale(1);\n        }\n        50% {\n            opacity: 0.5;\n            transform: scale(0.7);\n        }\n    }.type-select.svelte-1nhql4u {flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 10px;font-size:13px;cursor:pointer;}.type-select.svelte-1nhql4u:focus {border-color:var(--accent);}.search-input.svelte-1nhql4u {width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);padding:7px 10px;font-size:13px;}.search-input.svelte-1nhql4u:focus {border-color:var(--accent);outline:none;}.search-input.svelte-1nhql4u::placeholder {color:var(--text3);}.btn.feedback.svelte-1nhql4u {background:#0d3a1c;border-color:var(--green);color:var(--green);}\n\n    /* Utility */.row.svelte-1nhql4u {display:flex;}.gap-8.svelte-1nhql4u {gap:8px;}.align-center.svelte-1nhql4u {align-items:center;}.grow.svelte-1nhql4u {flex:1;min-width:0;}'
   };
   function App($$anchor, $$props) {
     push($$props, false);
     append_styles($$anchor, $$css);
     const selected = mutable_source();
+    const selectedTrainGroupId = mutable_source();
+    const selectedTrainGroup = mutable_source();
+    const trainEditorTargetId = mutable_source();
     const currentMapRef = mutable_source();
     const selectedType = mutable_source();
     const isSegmentType = mutable_source();
@@ -22724,13 +23139,20 @@ ${component_stack}
     const usesSingleZone = mutable_source();
     const usesDirection = mutable_source();
     const usesJumpArc = mutable_source();
+    const usesJumpTrain = mutable_source();
     const showSpeedWindow = mutable_source();
     const showTurn = mutable_source();
     const showState = mutable_source();
     const showLookDirection = mutable_source();
     const showLookRange = mutable_source();
     const showVelocityDirection = mutable_source();
+    const baseConstraintsVisible = mutable_source();
+    const constraintIndexById = mutable_source();
+    const trainGroupsVisible = mutable_source();
+    const trainArcRows = mutable_source();
+    const constraintsVisible = mutable_source();
     const constraintsFiltered = mutable_source();
+    const visibleCount = mutable_source();
     const enabledCount = mutable_source();
     const disabledCount = mutable_source();
     let store = prop($$props, "store", 8);
@@ -22802,6 +23224,9 @@ ${component_stack}
     let syncedConstraintRef = mutable_source(null);
     let autoImportedMapRef = mutable_source(null);
     let autoImportRetryTimer = mutable_source(null);
+    function isTrainArcRecord(record) {
+      return record?.constraint?.type === "JumpArc" && typeof record?.constraint?.trainGroupId === "string" && record.constraint.trainGroupId.length > 0;
+    }
     const TYPE_COLORS = {
       HardCheckpoint: "#58a6ff",
       SoftCheckpoint: "#79c0ff",
@@ -22809,6 +23234,7 @@ ${component_stack}
       LineSegment: "#3fb950",
       Corridor: "#26a641",
       JumpArc: "#f0883e",
+      JumpTrain: "#ff9933",
       TakeoffZone: "#ffa657",
       LandingZone: "#ffb77c",
       AirborneSegment: "#d2a8ff",
@@ -22826,6 +23252,7 @@ ${component_stack}
       LineSegment: "\u2571",
       Corridor: "\u27FA",
       JumpArc: "\u2312",
+      JumpTrain: "\u26D3",
       TakeoffZone: "\u2B06",
       LandingZone: "\u2B07",
       AirborneSegment: "\u301C",
@@ -22846,7 +23273,21 @@ ${component_stack}
       store().setPlacementArmed(true);
       store().setToolMode("place");
     }
+    function startJumpTrainMode() {
+      store().startJumpTrain();
+      onClose()?.();
+    }
     function beginRaycastPlacement(target = "center") {
+      if (target === "trainNode") {
+        if (!get2(state2).trainPlacementGroupId) {
+          store().startJumpTrain();
+        }
+        store().setPlacementTarget("trainNode");
+        store().setPlacementArmed(true);
+        store().setToolMode("place");
+        onClose()?.();
+        return;
+      }
       if (!get2(state2).selectedConstraintId) {
         const created = store().addConstraint(get2(newType) || "HardCheckpoint");
         store().selectConstraint(created.id);
@@ -22868,7 +23309,7 @@ ${component_stack}
       return out;
     }
     function commitLiveConstraint(nextLabel, nextType, nextConstraint) {
-      if (!get2(selected)) {
+      if (!get2(selected) || get2(usesJumpTrain)) {
         return;
       }
       const constraint = sanitizeConstraint({
@@ -22895,7 +23336,7 @@ ${component_stack}
       commitLiveConstraint(get2(editLabel), value, get2(editConstraint));
     }
     function applySelected() {
-      if (!get2(selected)) return;
+      if (!get2(selected) || get2(usesJumpTrain)) return;
       const constraint = sanitizeConstraint({ ...get2(editConstraint), type: get2(editType) });
       store().updateConstraint(get2(selected).id, {
         label: get2(editLabel) || "Constraint",
@@ -23039,10 +23480,11 @@ ${component_stack}
       event2.preventDefault();
       set(dragOverId, id);
     }
-    function onDropOnItem(event2, targetId) {
+    function onDropOnItem(event2, targetRecord) {
       event2.preventDefault();
       const id = get2(draggingId) || event2.dataTransfer.getData("text/plain");
-      if (!id || id === targetId) {
+      const targetId = targetRecord?.targetConstraintId || targetRecord?.id;
+      if (!id || !targetId || id === targetId) {
         set(draggingId, set(dragOverId, null));
         return;
       }
@@ -23065,6 +23507,19 @@ ${component_stack}
       store().moveConstraintToIndex(id, get2(state2).constraints.length - 1);
       set(draggingId, set(dragOverId, null));
     }
+    function selectListItem(record) {
+      if (record?.isVirtualTrainGroup) {
+        const group = store().getTrainGroupView(record.id);
+        const firstArcId = group?.arcIds?.[0] || null;
+        store().selectConstraint(firstArcId);
+        return;
+      }
+      if (record?.isVirtualTrainArc && record?.targetConstraintId) {
+        store().selectConstraint(record.targetConstraintId);
+        return;
+      }
+      store().selectConstraint(record.id);
+    }
     function typeColor2(type) {
       return TYPE_COLORS[type] || "#8b949e";
     }
@@ -23077,31 +23532,71 @@ ${component_stack}
     legacy_pre_effect(() => get2(state2), () => {
       set(selected, get2(state2).constraints.find((r) => r.id === get2(state2).selectedConstraintId) || null);
     });
+    legacy_pre_effect(() => (get2(selected), get2(state2)), () => {
+      set(selectedTrainGroupId, isTrainArcRecord(get2(selected)) ? get2(selected).constraint.trainGroupId : get2(state2).trainPlacementGroupId || null);
+    });
+    legacy_pre_effect(() => (get2(selectedTrainGroupId), deep_read_state(store())), () => {
+      set(selectedTrainGroup, get2(selectedTrainGroupId) ? store().getTrainGroupView(get2(selectedTrainGroupId)) : null);
+    });
+    legacy_pre_effect(() => (get2(selectedTrainGroupId), get2(selected)), () => {
+      set(trainEditorTargetId, get2(selectedTrainGroupId) || get2(selected)?.id || null);
+    });
     legacy_pre_effect(() => get2(state2), () => {
       set(currentMapRef, get2(state2).editorIntegration.mapRef || "unknown-map");
     });
     legacy_pre_effect(() => (get2(state2), deep_read_state(store())), () => {
       if (get2(state2).ui.activeTab === "list") store().setUiState({ activeTab: "edit" });
     });
-    legacy_pre_effect(() => (get2(selected), get2(syncedId)), () => {
+    legacy_pre_effect(() => (get2(selected), get2(syncedId), get2(selectedTrainGroup)), () => {
       if (get2(selected)?.id !== get2(syncedId)) {
         set(syncedId, get2(selected)?.id ?? null);
         set(editLabel, get2(selected)?.label ?? "");
-        set(editType, get2(selected)?.constraint.type ?? "HardCheckpoint");
-        set(editConstraint, { ...get2(selected)?.constraint || {} });
+        if (get2(selectedTrainGroup)) {
+          set(editType, "JumpTrain");
+          set(editConstraint, {
+            nodes: get2(selectedTrainGroup).nodes,
+            arcParams: get2(selectedTrainGroup).arcParams,
+            trainGroupId: get2(selectedTrainGroup).groupId
+          });
+        } else {
+          set(editType, get2(selected)?.constraint.type ?? "HardCheckpoint");
+          set(editConstraint, { ...get2(selected)?.constraint || {} });
+        }
         set(syncedConstraintRef, get2(selected)?.constraint || null);
       }
     });
-    legacy_pre_effect(() => (get2(selected), get2(syncedId), get2(syncedConstraintRef)), () => {
-      if (get2(selected) && get2(selected).id === get2(syncedId) && get2(selected).constraint && get2(selected).constraint !== get2(syncedConstraintRef)) {
-        set(syncedConstraintRef, get2(selected).constraint);
-        set(editLabel, get2(selected).label ?? "");
-        set(editType, get2(selected).constraint.type ?? "HardCheckpoint");
-        set(editConstraint, { ...get2(selected).constraint });
+    legacy_pre_effect(
+      () => (get2(selected), get2(syncedId), get2(syncedConstraintRef), get2(selectedTrainGroup)),
+      () => {
+        if (get2(selected) && get2(selected).id === get2(syncedId) && get2(selected).constraint && get2(selected).constraint !== get2(syncedConstraintRef)) {
+          set(syncedConstraintRef, get2(selected).constraint);
+          set(editLabel, get2(selected).label ?? "");
+          if (get2(selectedTrainGroup)) {
+            set(editType, "JumpTrain");
+            set(editConstraint, {
+              nodes: get2(selectedTrainGroup).nodes,
+              arcParams: get2(selectedTrainGroup).arcParams,
+              trainGroupId: get2(selectedTrainGroup).groupId
+            });
+          } else {
+            set(editType, get2(selected).constraint.type ?? "HardCheckpoint");
+            set(editConstraint, { ...get2(selected).constraint });
+          }
+        }
+      }
+    );
+    legacy_pre_effect(() => (get2(selectedTrainGroup), get2(selected), get2(syncedId)), () => {
+      if (get2(selectedTrainGroup) && get2(selected)?.id === get2(syncedId)) {
+        set(editType, "JumpTrain");
+        set(editConstraint, {
+          nodes: get2(selectedTrainGroup).nodes,
+          arcParams: get2(selectedTrainGroup).arcParams,
+          trainGroupId: get2(selectedTrainGroup).groupId
+        });
       }
     });
-    legacy_pre_effect(() => (get2(editType), get2(selected)), () => {
-      set(selectedType, get2(editType) || get2(selected)?.constraint?.type || "HardCheckpoint");
+    legacy_pre_effect(() => (get2(selectedTrainGroup), get2(selected), get2(editType)), () => {
+      set(selectedType, get2(selectedTrainGroup) || get2(selected)?.constraint?.type === "JumpTrain" ? "JumpTrain" : get2(editType) || get2(selected)?.constraint?.type || "HardCheckpoint");
     });
     legacy_pre_effect(() => get2(selectedType), () => {
       set(isSegmentType, get2(selectedType) === "LineSegment" || get2(selectedType) === "Corridor" || get2(selectedType) === "AirborneSegment");
@@ -23117,6 +23612,9 @@ ${component_stack}
     });
     legacy_pre_effect(() => get2(selectedType), () => {
       set(usesJumpArc, get2(selectedType) === "JumpArc");
+    });
+    legacy_pre_effect(() => (get2(selectedTrainGroup), get2(selected)), () => {
+      set(usesJumpTrain, Boolean(get2(selectedTrainGroup)) || get2(selected)?.constraint?.type === "JumpTrain");
     });
     legacy_pre_effect(() => get2(selectedType), () => {
       set(showSpeedWindow, get2(selectedType) === "SpeedWindow");
@@ -23137,17 +23635,93 @@ ${component_stack}
       set(showVelocityDirection, get2(selectedType) === "VelocityDirection");
     });
     legacy_pre_effect(() => get2(state2), () => {
-      set(constraintsFiltered, get2(state2).constraints.filter((record) => {
+      set(baseConstraintsVisible, get2(state2).constraints.map((record, index2) => ({ ...record, _listIndex: index2 })).filter((record) => record?.constraint?.type !== "JumpArc" && record?.constraint?.type !== "JumpTrain"));
+    });
+    legacy_pre_effect(() => get2(state2), () => {
+      set(constraintIndexById, new Map(get2(state2).constraints.map((record, index2) => [record.id, index2])));
+    });
+    legacy_pre_effect(() => (get2(state2), deep_read_state(store())), () => {
+      set(trainGroupsVisible, (() => {
+        const groups = /* @__PURE__ */ new Map();
+        get2(state2).constraints.forEach((record, index2) => {
+          if (!isTrainArcRecord(record)) return;
+          const groupId = record.constraint.trainGroupId;
+          const existing = groups.get(groupId) || {
+            id: groupId,
+            label: "Jump Train",
+            enabled: false,
+            arcCount: 0,
+            _listIndex: index2
+          };
+          existing.arcCount += 1;
+          existing.enabled = existing.enabled || !!record.enabled;
+          existing._listIndex = Math.min(existing._listIndex, index2);
+          groups.set(groupId, existing);
+        });
+        if (get2(state2).trainPlacementGroupId && !groups.has(get2(state2).trainPlacementGroupId)) {
+          groups.set(get2(state2).trainPlacementGroupId, {
+            id: get2(state2).trainPlacementGroupId,
+            label: "Jump Train (new)",
+            enabled: true,
+            arcCount: 0,
+            _listIndex: get2(state2).constraints.length + 0.5
+          });
+        }
+        return [...groups.values()].map((group) => {
+          const view = store().getTrainGroupView(group.id);
+          return {
+            id: group.id,
+            label: group.arcCount > 0 ? `Jump Train (${group.arcCount} arc${group.arcCount === 1 ? "" : "s"})` : group.label,
+            enabled: group.enabled,
+            constraint: { type: "JumpTrain" },
+            isVirtualTrainGroup: true,
+            arcIds: view?.arcIds || [],
+            _listIndex: group._listIndex
+          };
+        });
+      })());
+    });
+    legacy_pre_effect(
+      () => (get2(trainGroupsVisible), get2(state2), get2(constraintIndexById)),
+      () => {
+        set(trainArcRows, get2(trainGroupsVisible).flatMap((group) => (group.arcIds || []).map((arcId, idx) => ({
+          id: `${group.id}::arc::${idx}`,
+          label: `Arc ${idx + 1}`,
+          enabled: get2(state2).constraints.find((c) => c.id === arcId)?.enabled ?? true,
+          constraint: { type: "JumpArc" },
+          isVirtualTrainArc: true,
+          isVirtualTrainGroup: false,
+          groupId: group.id,
+          targetConstraintId: arcId,
+          _listIndex: (get2(constraintIndexById).get(arcId) ?? group._listIndex + idx) + 1e-3
+        }))));
+      }
+    );
+    legacy_pre_effect(
+      () => (get2(baseConstraintsVisible), get2(trainGroupsVisible), get2(trainArcRows)),
+      () => {
+        set(constraintsVisible, [
+          ...get2(baseConstraintsVisible),
+          ...get2(trainGroupsVisible).map((group) => ({ ...group, _listIndex: (group._listIndex ?? 0) - 1e-3 })),
+          ...get2(trainArcRows)
+        ].sort((a, b) => (a._listIndex ?? 0) - (b._listIndex ?? 0)));
+      }
+    );
+    legacy_pre_effect(() => (get2(constraintsVisible), get2(state2)), () => {
+      set(constraintsFiltered, get2(constraintsVisible).filter((record) => {
         const q = (get2(state2).ui.listFilter || "").toLowerCase().trim();
         if (!q) return true;
         return record.label.toLowerCase().includes(q) || record.constraint.type.toLowerCase().includes(q);
       }));
     });
-    legacy_pre_effect(() => get2(state2), () => {
-      set(enabledCount, get2(state2).constraints.filter((r) => r.enabled).length);
+    legacy_pre_effect(() => (get2(baseConstraintsVisible), get2(trainGroupsVisible)), () => {
+      set(visibleCount, get2(baseConstraintsVisible).length + get2(trainGroupsVisible).length);
     });
-    legacy_pre_effect(() => (get2(state2), get2(enabledCount)), () => {
-      set(disabledCount, get2(state2).constraints.length - get2(enabledCount));
+    legacy_pre_effect(() => (get2(baseConstraintsVisible), get2(trainGroupsVisible)), () => {
+      set(enabledCount, get2(baseConstraintsVisible).filter((r) => r.enabled).length + get2(trainGroupsVisible).filter((r) => r.enabled).length);
+    });
+    legacy_pre_effect(() => (get2(visibleCount), get2(enabledCount)), () => {
+      set(disabledCount, get2(visibleCount) - get2(enabledCount));
     });
     legacy_pre_effect(
       () => (get2(currentMapRef), get2(autoImportedMapRef), get2(state2), get2(autoImportRetryTimer)),
@@ -23205,7 +23779,7 @@ ${component_stack}
     reset(div_5);
     var button_2 = sibling(div_5, 2);
     let classes_1;
-    var node = child(button_2);
+    var node_1 = child(button_2);
     {
       var consequent = ($$anchor2) => {
         var fragment = root_2();
@@ -23213,88 +23787,112 @@ ${component_stack}
         append($$anchor2, fragment);
       };
       var alternate = ($$anchor2) => {
-        var text_3 = text("\u2295 Raycast Set Position");
+        var text_3 = text("\u26D3 New Jump Train");
         append($$anchor2, text_3);
       };
-      if_block(node, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).placementArmed)) $$render(consequent);
+      if_block(node_1, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).trainPlacementGroupId)) $$render(consequent);
         else $$render(alternate, -1);
       });
     }
     reset(button_2);
-    var input = sibling(button_2, 2);
+    var button_3 = sibling(button_2, 2);
+    let classes_2;
+    var node_2 = child(button_3);
+    {
+      var consequent_1 = ($$anchor2) => {
+        var fragment_1 = root_4();
+        next();
+        append($$anchor2, fragment_1);
+      };
+      var alternate_1 = ($$anchor2) => {
+        var text_4 = text("\u2295 Raycast Set Position");
+        append($$anchor2, text_4);
+      };
+      if_block(node_2, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).placementArmed)) $$render(consequent_1);
+        else $$render(alternate_1, -1);
+      });
+    }
+    reset(button_3);
+    var input = sibling(button_3, 2);
     remove_input_defaults(input);
     reset(div_4);
     var div_6 = sibling(div_4, 2);
     var span_3 = child(div_6);
-    var text_4 = child(span_3);
+    var text_5 = child(span_3);
     reset(span_3);
     var span_4 = sibling(span_3, 2);
-    var text_5 = child(span_4);
+    var text_6 = child(span_4);
     reset(span_4);
-    var node_1 = sibling(span_4, 2);
+    var node_3 = sibling(span_4, 2);
     {
-      var consequent_1 = ($$anchor2) => {
-        var span_5 = root_4();
-        var text_6 = child(span_5);
+      var consequent_2 = ($$anchor2) => {
+        var span_5 = root_6();
+        var text_7 = child(span_5);
         reset(span_5);
-        template_effect(() => set_text(text_6, `${get2(disabledCount) ?? ""} off`));
+        template_effect(() => set_text(text_7, `${get2(disabledCount) ?? ""} off`));
         append($$anchor2, span_5);
       };
-      if_block(node_1, ($$render) => {
-        if (get2(disabledCount) > 0) $$render(consequent_1);
+      if_block(node_3, ($$render) => {
+        if (get2(disabledCount) > 0) $$render(consequent_2);
       });
     }
     reset(div_6);
     var div_7 = sibling(div_6, 2);
-    var node_2 = child(div_7);
-    each(node_2, 3, () => get2(constraintsFiltered), (record) => record.id, ($$anchor2, record, index2) => {
-      var button_3 = root_5();
-      let classes_2;
-      var span_6 = sibling(child(button_3), 2);
-      var text_7 = child(span_6, true);
+    var node_4 = child(div_7);
+    each(node_4, 3, () => get2(constraintsFiltered), (record) => record.id, ($$anchor2, record, index2) => {
+      var button_4 = root_7();
+      let classes_3;
+      var span_6 = sibling(child(button_4), 2);
+      var text_8 = child(span_6, true);
       reset(span_6);
       var span_7 = sibling(span_6, 2);
-      var text_8 = child(span_7, true);
+      var text_9 = child(span_7, true);
       reset(span_7);
       var span_8 = sibling(span_7, 2);
       var span_9 = child(span_8);
-      var text_9 = child(span_9, true);
+      var text_10 = child(span_9, true);
       reset(span_9);
       var span_10 = sibling(span_9, 2);
-      var text_10 = child(span_10, true);
+      var text_11 = child(span_10, true);
       reset(span_10);
       reset(span_8);
-      var node_3 = sibling(span_8, 2);
+      var node_5 = sibling(span_8, 2);
       {
-        var consequent_2 = ($$anchor3) => {
-          var span_11 = root_6();
+        var consequent_3 = ($$anchor3) => {
+          var span_11 = root_8();
           append($$anchor3, span_11);
         };
-        var consequent_3 = ($$anchor3) => {
-          var span_12 = root_7();
+        var consequent_4 = ($$anchor3) => {
+          var span_12 = root_9();
           append($$anchor3, span_12);
         };
-        if_block(node_3, ($$render) => {
-          if (get2(record), untrack(() => !get2(record).enabled)) $$render(consequent_2);
-          else if (get2(record), get2(state2), untrack(() => get2(record).id === get2(state2).selectedConstraintId)) $$render(consequent_3, 1);
+        if_block(node_5, ($$render) => {
+          if (get2(record), untrack(() => !get2(record).enabled)) $$render(consequent_3);
+          else if (get2(record), get2(selectedTrainGroupId), get2(state2), untrack(() => get2(record).isVirtualTrainGroup ? get2(selectedTrainGroupId) === get2(record).id : get2(record).isVirtualTrainArc ? get2(record).targetConstraintId === get2(state2).selectedConstraintId : get2(record).id === get2(state2).selectedConstraintId)) $$render(consequent_4, 1);
         });
       }
-      next(2);
-      reset(button_3);
+      var span_13 = sibling(node_5, 2);
+      var text_12 = child(span_13, true);
+      reset(span_13);
+      reset(button_4);
       template_effect(
         ($0, $1, $2) => {
-          classes_2 = set_class(button_3, 1, "citem svelte-1nhql4u", null, classes_2, {
-            selected: get2(record).id === get2(state2).selectedConstraintId,
+          set_attribute2(button_4, "draggable", (get2(record), untrack(() => !get2(record).isVirtualTrainGroup && !get2(record).isVirtualTrainArc)));
+          classes_3 = set_class(button_4, 1, "citem svelte-1nhql4u", null, classes_3, {
+            "train-child": get2(record).isVirtualTrainArc,
+            selected: get2(record).isVirtualTrainGroup ? get2(selectedTrainGroupId) === get2(record).id : get2(record).isVirtualTrainArc ? get2(record).targetConstraintId === get2(state2).selectedConstraintId : get2(record).id === get2(state2).selectedConstraintId,
             disabled: !get2(record).enabled,
             dragover: get2(dragOverId) === get2(record).id
           });
-          set_style(button_3, `--tc: ${$0 ?? ""}`);
-          set_text(text_7, get2(index2) + 1);
+          set_style(button_4, `--tc: ${$0 ?? ""}`);
+          set_text(text_8, get2(index2) + 1);
           set_style(span_7, `color: ${$1 ?? ""}`);
-          set_text(text_8, $2);
-          set_text(text_9, (get2(record), untrack(() => get2(record).label || "Unnamed")));
-          set_text(text_10, (get2(record), untrack(() => get2(record).constraint.type)));
+          set_text(text_9, $2);
+          set_text(text_10, (get2(record), untrack(() => get2(record).label || "Unnamed")));
+          set_text(text_11, (get2(record), untrack(() => get2(record).constraint.type)));
+          set_text(text_12, (get2(record), untrack(() => get2(record).isVirtualTrainGroup || get2(record).isVirtualTrainArc ? "" : "\u283F")));
         },
         [
           () => (get2(record), untrack(() => typeColor2(get2(record).constraint.type))),
@@ -23302,37 +23900,37 @@ ${component_stack}
           () => (get2(record), untrack(() => typeIcon(get2(record).constraint.type)))
         ]
       );
-      event("dragstart", button_3, (e) => onDragStart(e, get2(record).id));
-      event("dragover", button_3, (e) => onDragOver(e, get2(record).id));
-      event("drop", button_3, (e) => onDropOnItem(e, get2(record).id));
-      event("dragend", button_3, () => {
+      event("dragstart", button_4, (e) => !get2(record).isVirtualTrainGroup && !get2(record).isVirtualTrainArc && onDragStart(e, get2(record).id));
+      event("dragover", button_4, (e) => !get2(record).isVirtualTrainGroup && onDragOver(e, get2(record).id));
+      event("drop", button_4, (e) => !get2(record).isVirtualTrainGroup && onDropOnItem(e, get2(record)));
+      event("dragend", button_4, () => {
         set(draggingId, null);
         set(dragOverId, null);
       });
-      event("click", button_3, () => store().selectConstraint(get2(record).id));
-      append($$anchor2, button_3);
+      event("click", button_4, () => selectListItem(get2(record)));
+      append($$anchor2, button_4);
     });
-    var node_4 = sibling(node_2, 2);
+    var node_6 = sibling(node_4, 2);
     {
-      var consequent_4 = ($$anchor2) => {
-        var div_8 = root_8();
-        var text_11 = child(div_8, true);
+      var consequent_5 = ($$anchor2) => {
+        var div_8 = root_10();
+        var text_13 = child(div_8, true);
         reset(div_8);
-        template_effect(() => set_text(text_11, (get2(state2), untrack(() => get2(state2).constraints.length === 0 ? "No constraints yet. Add one above." : "No matches."))));
+        template_effect(() => set_text(text_13, get2(visibleCount) === 0 ? "No constraints yet. Add one above." : "No matches."));
         append($$anchor2, div_8);
       };
-      if_block(node_4, ($$render) => {
-        if (get2(constraintsFiltered), untrack(() => get2(constraintsFiltered).length === 0)) $$render(consequent_4);
+      if_block(node_6, ($$render) => {
+        if (get2(constraintsFiltered), untrack(() => get2(constraintsFiltered).length === 0)) $$render(consequent_5);
       });
     }
-    var div_9 = sibling(node_4, 2);
+    var div_9 = sibling(node_6, 2);
     reset(div_7);
     reset(aside);
     var section = sibling(aside, 2);
     var nav = child(section);
-    var node_5 = child(nav);
+    var node_7 = child(nav);
     each(
-      node_5,
+      node_7,
       0,
       () => [
         ["edit", "Edit"],
@@ -23345,45 +23943,45 @@ ${component_stack}
         var $$array = user_derived(() => to_array($$item, 2));
         let id = () => get2($$array)[0];
         let label = () => get2($$array)[1];
-        var button_4 = root_9();
-        let classes_3;
-        var text_12 = child(button_4, true);
-        reset(button_4);
+        var button_5 = root_11();
+        let classes_4;
+        var text_14 = child(button_5, true);
+        reset(button_5);
         template_effect(() => {
-          classes_3 = set_class(button_4, 1, "tab svelte-1nhql4u", null, classes_3, { active: get2(state2).ui.activeTab === id() });
-          set_text(text_12, label());
+          classes_4 = set_class(button_5, 1, "tab svelte-1nhql4u", null, classes_4, { active: get2(state2).ui.activeTab === id() });
+          set_text(text_14, label());
         });
-        event("click", button_4, () => switchTab(id()));
-        append($$anchor2, button_4);
+        event("click", button_5, () => switchTab(id()));
+        append($$anchor2, button_5);
       }
     );
-    var div_10 = sibling(node_5, 4);
-    var button_5 = child(div_10);
-    var button_6 = sibling(button_5, 2);
+    var div_10 = sibling(node_7, 4);
+    var button_6 = child(div_10);
+    var button_7 = sibling(button_6, 2);
     reset(div_10);
     reset(nav);
     var div_11 = sibling(nav, 2);
-    var node_6 = child(div_11);
+    var node_8 = child(div_11);
     {
-      var consequent_31 = ($$anchor2) => {
-        var fragment_1 = comment();
-        var node_7 = first_child(fragment_1);
+      var consequent_41 = ($$anchor2) => {
+        var fragment_2 = comment();
+        var node_9 = first_child(fragment_2);
         {
-          var consequent_30 = ($$anchor3) => {
-            var div_12 = root_11();
+          var consequent_40 = ($$anchor3) => {
+            var div_12 = root_13();
             var div_13 = child(div_12);
-            var span_13 = child(div_13);
-            var text_13 = child(span_13, true);
-            reset(span_13);
-            var span_14 = sibling(span_13, 2);
-            var text_14 = child(span_14, true);
+            var span_14 = child(div_13);
+            var text_15 = child(span_14, true);
             reset(span_14);
-            var button_7 = sibling(span_14, 4);
-            let classes_4;
-            var text_15 = child(button_7, true);
-            reset(button_7);
-            var button_8 = sibling(button_7, 2);
+            var span_15 = sibling(span_14, 2);
+            var text_16 = child(span_15, true);
+            reset(span_15);
+            var button_8 = sibling(span_15, 4);
+            let classes_5;
+            var text_17 = child(button_8, true);
+            reset(button_8);
             var button_9 = sibling(button_8, 2);
+            var button_10 = sibling(button_9, 2);
             reset(div_13);
             var div_14 = sibling(div_13, 2);
             var div_15 = sibling(child(div_14), 2);
@@ -23391,53 +23989,86 @@ ${component_stack}
             remove_input_defaults(input_1);
             reset(div_15);
             reset(div_14);
-            var div_16 = sibling(div_14, 2);
-            var select_1 = sibling(child(div_16), 2);
-            each(select_1, 5, () => CONSTRAINT_TYPES, index, ($$anchor4, type) => {
-              var option_1 = root_12();
-              var text_16 = child(option_1);
-              reset(option_1);
-              var option_1_value = {};
-              template_effect(
-                ($0) => {
-                  set_text(text_16, `${$0 ?? ""} ${get2(type) ?? ""}`);
-                  if (option_1_value !== (option_1_value = get2(type))) {
-                    option_1.value = (option_1.__value = get2(type)) ?? "";
-                  }
-                },
-                [() => (get2(type), untrack(() => typeIcon(get2(type))))]
-              );
-              append($$anchor4, option_1);
-            });
-            reset(select_1);
-            var select_1_value;
-            init_select(select_1);
-            reset(div_16);
-            var div_17 = sibling(div_16, 2);
-            var div_18 = child(div_17);
-            var div_19 = sibling(child(div_18), 2);
-            var button_10 = child(div_19);
-            reset(div_19);
-            reset(div_18);
-            var div_20 = sibling(div_18, 2);
-            var div_21 = child(div_20);
-            var input_2 = sibling(child(div_21), 2);
-            remove_input_defaults(input_2);
-            reset(div_21);
-            var div_22 = sibling(div_21, 2);
-            var input_3 = sibling(child(div_22), 2);
-            remove_input_defaults(input_3);
-            reset(div_22);
-            var div_23 = sibling(div_22, 2);
-            var input_4 = sibling(child(div_23), 2);
-            remove_input_defaults(input_4);
-            reset(div_23);
-            reset(div_20);
-            reset(div_17);
-            var node_8 = sibling(div_17, 2);
+            var node_10 = sibling(div_14, 2);
             {
-              var consequent_5 = ($$anchor4) => {
-                var div_24 = root_13();
+              var consequent_6 = ($$anchor4) => {
+                var div_16 = root_14();
+                var select_1 = sibling(child(div_16), 2);
+                each(select_1, 5, () => CONSTRAINT_TYPES, index, ($$anchor5, type) => {
+                  var option_1 = root_15();
+                  var text_18 = child(option_1);
+                  reset(option_1);
+                  var option_1_value = {};
+                  template_effect(
+                    ($0) => {
+                      set_text(text_18, `${$0 ?? ""} ${get2(type) ?? ""}`);
+                      if (option_1_value !== (option_1_value = get2(type))) {
+                        option_1.value = (option_1.__value = get2(type)) ?? "";
+                      }
+                    },
+                    [() => (get2(type), untrack(() => typeIcon(get2(type))))]
+                  );
+                  append($$anchor5, option_1);
+                });
+                reset(select_1);
+                var select_1_value;
+                init_select(select_1);
+                reset(div_16);
+                template_effect(() => {
+                  if (select_1_value !== (select_1_value = get2(editType))) {
+                    select_1.value = (select_1.__value = get2(editType)) ?? "", select_option(select_1, get2(editType));
+                  }
+                });
+                event("change", select_1, (e) => updateEditType(e.currentTarget.value));
+                append($$anchor4, div_16);
+              };
+              if_block(node_10, ($$render) => {
+                if (!get2(usesJumpTrain) && get2(selectedType) !== "JumpArc") $$render(consequent_6);
+              });
+            }
+            var node_11 = sibling(node_10, 2);
+            {
+              var consequent_7 = ($$anchor4) => {
+                var div_17 = root_16();
+                var div_18 = child(div_17);
+                var div_19 = sibling(child(div_18), 2);
+                var button_11 = child(div_19);
+                reset(div_19);
+                reset(div_18);
+                var div_20 = sibling(div_18, 2);
+                var div_21 = child(div_20);
+                var input_2 = sibling(child(div_21), 2);
+                remove_input_defaults(input_2);
+                reset(div_21);
+                var div_22 = sibling(div_21, 2);
+                var input_3 = sibling(child(div_22), 2);
+                remove_input_defaults(input_3);
+                reset(div_22);
+                var div_23 = sibling(div_22, 2);
+                var input_4 = sibling(child(div_23), 2);
+                remove_input_defaults(input_4);
+                reset(div_23);
+                reset(div_20);
+                reset(div_17);
+                template_effect(() => {
+                  set_value(input_2, (get2(editConstraint), untrack(() => get2(editConstraint).cx ?? 0)));
+                  set_value(input_3, (get2(editConstraint), untrack(() => get2(editConstraint).cy ?? 0)));
+                  set_value(input_4, (get2(editConstraint), untrack(() => get2(editConstraint).cz ?? 0)));
+                });
+                event("click", button_11, () => beginRaycastPlacement("center"));
+                event("input", input_2, (e) => updateEditField("cx", e.currentTarget.value));
+                event("input", input_3, (e) => updateEditField("cy", e.currentTarget.value));
+                event("input", input_4, (e) => updateEditField("cz", e.currentTarget.value));
+                append($$anchor4, div_17);
+              };
+              if_block(node_11, ($$render) => {
+                if (!get2(usesJumpTrain)) $$render(consequent_7);
+              });
+            }
+            var node_12 = sibling(node_11, 2);
+            {
+              var consequent_8 = ($$anchor4) => {
+                var div_24 = root_17();
                 var div_25 = sibling(child(div_24), 2);
                 var div_26 = child(div_25);
                 var input_5 = sibling(child(div_26), 2);
@@ -23463,23 +24094,23 @@ ${component_stack}
                 event("input", input_7, (e) => updateEditField("nz", e.currentTarget.value));
                 append($$anchor4, div_24);
               };
-              if_block(node_8, ($$render) => {
-                if (get2(usesDirection)) $$render(consequent_5);
+              if_block(node_12, ($$render) => {
+                if (get2(usesDirection)) $$render(consequent_8);
               });
             }
-            var node_9 = sibling(node_8, 2);
+            var node_13 = sibling(node_12, 2);
             {
-              var consequent_8 = ($$anchor4) => {
-                var div_29 = root_14();
+              var consequent_11 = ($$anchor4) => {
+                var div_29 = root_18();
                 var div_30 = sibling(child(div_29), 2);
                 var select_2 = child(div_30);
                 each(select_2, 5, () => HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_2 = root_15();
-                  var text_17 = child(option_2, true);
+                  var option_2 = root_19();
+                  var text_19 = child(option_2, true);
                   reset(option_2);
                   var option_2_value = {};
                   template_effect(() => {
-                    set_text(text_17, get2(shape));
+                    set_text(text_19, get2(shape));
                     if (option_2_value !== (option_2_value = get2(shape))) {
                       option_2.value = (option_2.__value = get2(shape)) ?? "";
                     }
@@ -23490,10 +24121,10 @@ ${component_stack}
                 var select_2_value;
                 init_select(select_2);
                 reset(div_30);
-                var node_10 = sibling(div_30, 2);
+                var node_14 = sibling(div_30, 2);
                 {
-                  var consequent_6 = ($$anchor5) => {
-                    var div_31 = root_16();
+                  var consequent_9 = ($$anchor5) => {
+                    var div_31 = root_20();
                     var input_8 = child(div_31);
                     remove_input_defaults(input_8);
                     next(2);
@@ -23502,8 +24133,8 @@ ${component_stack}
                     event("input", input_8, (e) => updateEditField("radius", e.currentTarget.value));
                     append($$anchor5, div_31);
                   };
-                  var consequent_7 = ($$anchor5) => {
-                    var div_32 = root_17();
+                  var consequent_10 = ($$anchor5) => {
+                    var div_32 = root_21();
                     var div_33 = child(div_32);
                     var input_9 = sibling(child(div_33), 2);
                     remove_input_defaults(input_9);
@@ -23521,10 +24152,10 @@ ${component_stack}
                     event("input", input_10, (e) => updateEditField("height", e.currentTarget.value));
                     append($$anchor5, div_32);
                   };
-                  var alternate_1 = ($$anchor5) => {
-                    var fragment_2 = root_18();
-                    var div_35 = first_child(fragment_2);
-                    var button_11 = child(div_35);
+                  var alternate_2 = ($$anchor5) => {
+                    var fragment_3 = root_22();
+                    var div_35 = first_child(fragment_3);
+                    var button_12 = child(div_35);
                     reset(div_35);
                     var div_36 = sibling(div_35, 2);
                     var div_37 = child(div_36);
@@ -23545,16 +24176,16 @@ ${component_stack}
                       set_value(input_12, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
                       set_value(input_13, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
                     });
-                    event("click", button_11, () => beginRaycastPlacement("size"));
+                    event("click", button_12, () => beginRaycastPlacement("size"));
                     event("input", input_11, (e) => updateEditField("sizeX", e.currentTarget.value));
                     event("input", input_12, (e) => updateEditField("sizeY", e.currentTarget.value));
                     event("input", input_13, (e) => updateEditField("sizeZ", e.currentTarget.value));
-                    append($$anchor5, fragment_2);
+                    append($$anchor5, fragment_3);
                   };
-                  if_block(node_10, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "sphere" || (get2(editConstraint).hitboxType || "sphere") === "circle")) $$render(consequent_6);
-                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "cylinder")) $$render(consequent_7, 1);
-                    else $$render(alternate_1, -1);
+                  if_block(node_14, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "sphere" || (get2(editConstraint).hitboxType || "sphere") === "circle")) $$render(consequent_9);
+                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "cylinder")) $$render(consequent_10, 1);
+                    else $$render(alternate_2, -1);
                   });
                 }
                 reset(div_29);
@@ -23566,18 +24197,18 @@ ${component_stack}
                 event("change", select_2, (e) => updateEditField("hitboxType", e.currentTarget.value));
                 append($$anchor4, div_29);
               };
-              if_block(node_9, ($$render) => {
-                if (get2(usesSingleZone)) $$render(consequent_8);
+              if_block(node_13, ($$render) => {
+                if (get2(usesSingleZone)) $$render(consequent_11);
               });
             }
-            var node_11 = sibling(node_9, 2);
+            var node_15 = sibling(node_13, 2);
             {
-              var consequent_11 = ($$anchor4) => {
-                var fragment_3 = root_19();
-                var div_40 = first_child(fragment_3);
+              var consequent_14 = ($$anchor4) => {
+                var fragment_4 = root_23();
+                var div_40 = first_child(fragment_4);
                 var div_41 = child(div_40);
                 var div_42 = sibling(child(div_41), 2);
-                var button_12 = child(div_42);
+                var button_13 = child(div_42);
                 reset(div_42);
                 reset(div_41);
                 var div_43 = sibling(div_41, 2);
@@ -23598,7 +24229,7 @@ ${component_stack}
                 var div_47 = sibling(div_40, 2);
                 var div_48 = child(div_47);
                 var div_49 = sibling(child(div_48), 2);
-                var button_13 = child(div_49);
+                var button_14 = child(div_49);
                 reset(div_49);
                 reset(div_48);
                 var div_50 = sibling(div_48, 2);
@@ -23618,12 +24249,12 @@ ${component_stack}
                 var div_54 = sibling(div_50, 2);
                 var select_3 = child(div_54);
                 each(select_3, 5, () => SEGMENT_HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_3 = root_20();
-                  var text_18 = child(option_3, true);
+                  var option_3 = root_24();
+                  var text_20 = child(option_3, true);
                   reset(option_3);
                   var option_3_value = {};
                   template_effect(() => {
-                    set_text(text_18, get2(shape));
+                    set_text(text_20, get2(shape));
                     if (option_3_value !== (option_3_value = get2(shape))) {
                       option_3.value = (option_3.__value = get2(shape)) ?? "";
                     }
@@ -23634,20 +24265,20 @@ ${component_stack}
                 var select_3_value;
                 init_select(select_3);
                 reset(div_54);
-                var node_12 = sibling(div_54, 2);
+                var node_16 = sibling(div_54, 2);
                 {
-                  var consequent_10 = ($$anchor5) => {
-                    var fragment_4 = comment();
-                    var node_13 = first_child(fragment_4);
+                  var consequent_13 = ($$anchor5) => {
+                    var fragment_5 = comment();
+                    var node_17 = first_child(fragment_5);
                     {
-                      var consequent_9 = ($$anchor6) => {
-                        var div_55 = root_22();
+                      var consequent_12 = ($$anchor6) => {
+                        var div_55 = root_26();
                         append($$anchor6, div_55);
                       };
-                      var alternate_2 = ($$anchor6) => {
-                        var fragment_5 = root_23();
-                        var div_56 = first_child(fragment_5);
-                        var button_14 = child(div_56);
+                      var alternate_3 = ($$anchor6) => {
+                        var fragment_6 = root_27();
+                        var div_56 = first_child(fragment_6);
+                        var button_15 = child(div_56);
                         reset(div_56);
                         var div_57 = sibling(div_56, 2);
                         var div_58 = child(div_57);
@@ -23668,21 +24299,21 @@ ${component_stack}
                           set_value(input_21, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
                           set_value(input_22, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
                         });
-                        event("click", button_14, () => beginRaycastPlacement("segmentSize"));
+                        event("click", button_15, () => beginRaycastPlacement("segmentSize"));
                         event("input", input_20, (e) => updateEditField("sizeX", e.currentTarget.value));
                         event("input", input_21, (e) => updateEditField("sizeY", e.currentTarget.value));
                         event("input", input_22, (e) => updateEditField("sizeZ", e.currentTarget.value));
-                        append($$anchor6, fragment_5);
+                        append($$anchor6, fragment_6);
                       };
-                      if_block(node_13, ($$render) => {
-                        if (get2(isAirborneSegment)) $$render(consequent_9);
-                        else $$render(alternate_2, -1);
+                      if_block(node_17, ($$render) => {
+                        if (get2(isAirborneSegment)) $$render(consequent_12);
+                        else $$render(alternate_3, -1);
                       });
                     }
-                    append($$anchor5, fragment_4);
+                    append($$anchor5, fragment_5);
                   };
-                  var alternate_3 = ($$anchor5) => {
-                    var div_61 = root_24();
+                  var alternate_4 = ($$anchor5) => {
+                    var div_61 = root_28();
                     var input_23 = child(div_61);
                     remove_input_defaults(input_23);
                     next(2);
@@ -23691,9 +24322,9 @@ ${component_stack}
                     event("input", input_23, (e) => updateEditField("radius", e.currentTarget.value));
                     append($$anchor5, div_61);
                   };
-                  if_block(node_12, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "cylinder") === "box")) $$render(consequent_10);
-                    else $$render(alternate_3, -1);
+                  if_block(node_16, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "cylinder") === "box")) $$render(consequent_13);
+                    else $$render(alternate_4, -1);
                   });
                 }
                 reset(div_47);
@@ -23708,25 +24339,25 @@ ${component_stack}
                     select_3.value = (select_3.__value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "cylinder"))) ?? "", select_option(select_3, (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "cylinder")));
                   }
                 });
-                event("click", button_12, () => beginRaycastPlacement("start"));
+                event("click", button_13, () => beginRaycastPlacement("start"));
                 event("input", input_14, (e) => updateEditField("ax", e.currentTarget.value));
                 event("input", input_15, (e) => updateEditField("ay", e.currentTarget.value));
                 event("input", input_16, (e) => updateEditField("az", e.currentTarget.value));
-                event("click", button_13, () => beginRaycastPlacement("end"));
+                event("click", button_14, () => beginRaycastPlacement("end"));
                 event("input", input_17, (e) => updateEditField("bx", e.currentTarget.value));
                 event("input", input_18, (e) => updateEditField("by", e.currentTarget.value));
                 event("input", input_19, (e) => updateEditField("bz", e.currentTarget.value));
                 event("change", select_3, (e) => updateEditField("hitboxType", e.currentTarget.value));
-                append($$anchor4, fragment_3);
+                append($$anchor4, fragment_4);
               };
-              if_block(node_11, ($$render) => {
-                if (get2(isSegmentType)) $$render(consequent_11);
+              if_block(node_15, ($$render) => {
+                if (get2(isSegmentType)) $$render(consequent_14);
               });
             }
-            var node_14 = sibling(node_11, 2);
+            var node_18 = sibling(node_15, 2);
             {
-              var consequent_12 = ($$anchor4) => {
-                var div_62 = root_25();
+              var consequent_15 = ($$anchor4) => {
+                var div_62 = root_29();
                 var div_63 = sibling(child(div_62), 2);
                 var input_24 = child(div_63);
                 remove_input_defaults(input_24);
@@ -23737,18 +24368,18 @@ ${component_stack}
                 event("input", input_24, (e) => updateEditField("jumpYVel", e.currentTarget.value));
                 append($$anchor4, div_62);
               };
-              if_block(node_14, ($$render) => {
-                if (get2(usesJumpArc)) $$render(consequent_12);
+              if_block(node_18, ($$render) => {
+                if (get2(usesJumpArc)) $$render(consequent_15);
               });
             }
-            var node_15 = sibling(node_14, 2);
+            var node_19 = sibling(node_18, 2);
             {
-              var consequent_20 = ($$anchor4) => {
-                var fragment_6 = root_26();
-                var div_64 = first_child(fragment_6);
+              var consequent_23 = ($$anchor4) => {
+                var fragment_7 = root_30();
+                var div_64 = first_child(fragment_7);
                 var div_65 = child(div_64);
                 var div_66 = sibling(child(div_65), 2);
-                var button_15 = child(div_66);
+                var button_16 = child(div_66);
                 reset(div_66);
                 reset(div_65);
                 var div_67 = sibling(div_65, 2);
@@ -23768,12 +24399,12 @@ ${component_stack}
                 var div_71 = sibling(div_67, 2);
                 var select_4 = child(div_71);
                 each(select_4, 5, () => HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_4 = root_27();
-                  var text_19 = child(option_4, true);
+                  var option_4 = root_31();
+                  var text_21 = child(option_4, true);
                   reset(option_4);
                   var option_4_value = {};
                   template_effect(() => {
-                    set_text(text_19, get2(shape));
+                    set_text(text_21, get2(shape));
                     if (option_4_value !== (option_4_value = get2(shape))) {
                       option_4.value = (option_4.__value = get2(shape)) ?? "";
                     }
@@ -23784,10 +24415,10 @@ ${component_stack}
                 var select_4_value;
                 init_select(select_4);
                 reset(div_71);
-                var node_16 = sibling(div_71, 2);
+                var node_20 = sibling(div_71, 2);
                 {
-                  var consequent_13 = ($$anchor5) => {
-                    var div_72 = root_28();
+                  var consequent_16 = ($$anchor5) => {
+                    var div_72 = root_32();
                     var input_28 = child(div_72);
                     remove_input_defaults(input_28);
                     next(2);
@@ -23796,8 +24427,8 @@ ${component_stack}
                     event("input", input_28, (e) => updateEditField("takeoffRadius", e.currentTarget.value));
                     append($$anchor5, div_72);
                   };
-                  var consequent_14 = ($$anchor5) => {
-                    var div_73 = root_29();
+                  var consequent_17 = ($$anchor5) => {
+                    var div_73 = root_33();
                     var div_74 = child(div_73);
                     var input_29 = sibling(child(div_74), 2);
                     remove_input_defaults(input_29);
@@ -23815,10 +24446,10 @@ ${component_stack}
                     event("input", input_30, (e) => updateEditField("takeoffHeight", e.currentTarget.value));
                     append($$anchor5, div_73);
                   };
-                  var alternate_4 = ($$anchor5) => {
-                    var fragment_7 = root_30();
-                    var div_76 = first_child(fragment_7);
-                    var button_16 = child(div_76);
+                  var alternate_5 = ($$anchor5) => {
+                    var fragment_8 = root_34();
+                    var div_76 = first_child(fragment_8);
+                    var button_17 = child(div_76);
                     reset(div_76);
                     var div_77 = sibling(div_76, 2);
                     var div_78 = child(div_77);
@@ -23839,46 +24470,46 @@ ${component_stack}
                       set_value(input_32, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeY ?? 8)));
                       set_value(input_33, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeZ ?? 8)));
                     });
-                    event("click", button_16, () => beginRaycastPlacement("takeoffSize"));
+                    event("click", button_17, () => beginRaycastPlacement("takeoffSize"));
                     event("input", input_31, (e) => updateEditField("takeoffSizeX", e.currentTarget.value));
                     event("input", input_32, (e) => updateEditField("takeoffSizeY", e.currentTarget.value));
                     event("input", input_33, (e) => updateEditField("takeoffSizeZ", e.currentTarget.value));
-                    append($$anchor5, fragment_7);
+                    append($$anchor5, fragment_8);
                   };
-                  if_block(node_16, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "sphere" || (get2(editConstraint).takeoffHitboxType || "sphere") === "circle")) $$render(consequent_13);
-                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "cylinder")) $$render(consequent_14, 1);
-                    else $$render(alternate_4, -1);
+                  if_block(node_20, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "sphere" || (get2(editConstraint).takeoffHitboxType || "sphere") === "circle")) $$render(consequent_16);
+                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "cylinder")) $$render(consequent_17, 1);
+                    else $$render(alternate_5, -1);
                   });
                 }
                 reset(div_64);
                 var div_81 = sibling(div_64, 2);
                 var div_82 = child(div_81);
                 var div_83 = sibling(child(div_82), 2);
-                var button_17 = child(div_83);
-                let classes_5;
-                var node_17 = child(button_17);
+                var button_18 = child(div_83);
+                let classes_6;
+                var node_21 = child(button_18);
                 {
-                  var consequent_15 = ($$anchor5) => {
-                    var fragment_8 = root_31();
+                  var consequent_18 = ($$anchor5) => {
+                    var fragment_9 = root_35();
                     next();
-                    append($$anchor5, fragment_8);
+                    append($$anchor5, fragment_9);
                   };
-                  var alternate_5 = ($$anchor5) => {
-                    var text_20 = text("Sample Takeoff Spot");
-                    append($$anchor5, text_20);
+                  var alternate_6 = ($$anchor5) => {
+                    var text_22 = text("Sample Takeoff Spot");
+                    append($$anchor5, text_22);
                   };
-                  if_block(node_17, ($$render) => {
-                    if (get2(state2), untrack(() => get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample")) $$render(consequent_15);
-                    else $$render(alternate_5, -1);
+                  if_block(node_21, ($$render) => {
+                    if (get2(state2), untrack(() => get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample")) $$render(consequent_18);
+                    else $$render(alternate_6, -1);
                   });
                 }
-                reset(button_17);
-                var node_18 = sibling(button_17, 2);
+                reset(button_18);
+                var node_22 = sibling(button_18, 2);
                 {
-                  var consequent_16 = ($$anchor5) => {
-                    var button_18 = root_33();
-                    event("click", button_18, () => {
+                  var consequent_19 = ($$anchor5) => {
+                    var button_19 = root_37();
+                    event("click", button_19, () => {
                       store().updateConstraint(get2(selected).id, {
                         constraint: {
                           takeoffSampleCx: null,
@@ -23893,19 +24524,19 @@ ${component_stack}
                         takeoffSampleCz: null
                       });
                     });
-                    append($$anchor5, button_18);
+                    append($$anchor5, button_19);
                   };
                   var d_1 = user_derived(() => (get2(editConstraint), untrack(() => Number.isFinite(get2(editConstraint).takeoffSampleCx))));
-                  if_block(node_18, ($$render) => {
-                    if (get2(d_1)) $$render(consequent_16);
+                  if_block(node_22, ($$render) => {
+                    if (get2(d_1)) $$render(consequent_19);
                   });
                 }
                 reset(div_83);
                 reset(div_82);
-                var node_19 = sibling(div_82, 2);
+                var node_23 = sibling(div_82, 2);
                 {
-                  var consequent_17 = ($$anchor5) => {
-                    var div_84 = root_34();
+                  var consequent_20 = ($$anchor5) => {
+                    var div_84 = root_38();
                     var div_85 = child(div_84);
                     var input_34 = sibling(child(div_85), 2);
                     remove_input_defaults(input_34);
@@ -23934,20 +24565,20 @@ ${component_stack}
                     append($$anchor5, div_84);
                   };
                   var d_2 = user_derived(() => (get2(editConstraint), untrack(() => Number.isFinite(get2(editConstraint).takeoffSampleCx))));
-                  var alternate_6 = ($$anchor5) => {
-                    var div_88 = root_35();
+                  var alternate_7 = ($$anchor5) => {
+                    var div_88 = root_39();
                     append($$anchor5, div_88);
                   };
-                  if_block(node_19, ($$render) => {
-                    if (get2(d_2)) $$render(consequent_17);
-                    else $$render(alternate_6, -1);
+                  if_block(node_23, ($$render) => {
+                    if (get2(d_2)) $$render(consequent_20);
+                    else $$render(alternate_7, -1);
                   });
                 }
                 reset(div_81);
                 var div_89 = sibling(div_81, 2);
                 var div_90 = child(div_89);
                 var div_91 = sibling(child(div_90), 2);
-                var button_19 = child(div_91);
+                var button_20 = child(div_91);
                 reset(div_91);
                 reset(div_90);
                 var div_92 = sibling(div_90, 2);
@@ -23967,12 +24598,12 @@ ${component_stack}
                 var div_96 = sibling(div_92, 2);
                 var select_5 = child(div_96);
                 each(select_5, 5, () => HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_5 = root_36();
-                  var text_21 = child(option_5, true);
+                  var option_5 = root_40();
+                  var text_23 = child(option_5, true);
                   reset(option_5);
                   var option_5_value = {};
                   template_effect(() => {
-                    set_text(text_21, get2(shape));
+                    set_text(text_23, get2(shape));
                     if (option_5_value !== (option_5_value = get2(shape))) {
                       option_5.value = (option_5.__value = get2(shape)) ?? "";
                     }
@@ -23983,10 +24614,10 @@ ${component_stack}
                 var select_5_value;
                 init_select(select_5);
                 reset(div_96);
-                var node_20 = sibling(div_96, 2);
+                var node_24 = sibling(div_96, 2);
                 {
-                  var consequent_18 = ($$anchor5) => {
-                    var div_97 = root_37();
+                  var consequent_21 = ($$anchor5) => {
+                    var div_97 = root_41();
                     var input_40 = child(div_97);
                     remove_input_defaults(input_40);
                     next(2);
@@ -23995,8 +24626,8 @@ ${component_stack}
                     event("input", input_40, (e) => updateEditField("landingRadius", e.currentTarget.value));
                     append($$anchor5, div_97);
                   };
-                  var consequent_19 = ($$anchor5) => {
-                    var div_98 = root_38();
+                  var consequent_22 = ($$anchor5) => {
+                    var div_98 = root_42();
                     var div_99 = child(div_98);
                     var input_41 = sibling(child(div_99), 2);
                     remove_input_defaults(input_41);
@@ -24014,10 +24645,10 @@ ${component_stack}
                     event("input", input_42, (e) => updateEditField("landingHeight", e.currentTarget.value));
                     append($$anchor5, div_98);
                   };
-                  var alternate_7 = ($$anchor5) => {
-                    var fragment_9 = root_39();
-                    var div_101 = first_child(fragment_9);
-                    var button_20 = child(div_101);
+                  var alternate_8 = ($$anchor5) => {
+                    var fragment_10 = root_43();
+                    var div_101 = first_child(fragment_10);
+                    var button_21 = child(div_101);
                     reset(div_101);
                     var div_102 = sibling(div_101, 2);
                     var div_103 = child(div_102);
@@ -24038,16 +24669,16 @@ ${component_stack}
                       set_value(input_44, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeY ?? 8)));
                       set_value(input_45, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeZ ?? 8)));
                     });
-                    event("click", button_20, () => beginRaycastPlacement("landingSize"));
+                    event("click", button_21, () => beginRaycastPlacement("landingSize"));
                     event("input", input_43, (e) => updateEditField("landingSizeX", e.currentTarget.value));
                     event("input", input_44, (e) => updateEditField("landingSizeY", e.currentTarget.value));
                     event("input", input_45, (e) => updateEditField("landingSizeZ", e.currentTarget.value));
-                    append($$anchor5, fragment_9);
+                    append($$anchor5, fragment_10);
                   };
-                  if_block(node_20, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "sphere" || (get2(editConstraint).landingHitboxType || "sphere") === "circle")) $$render(consequent_18);
-                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "cylinder")) $$render(consequent_19, 1);
-                    else $$render(alternate_7, -1);
+                  if_block(node_24, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "sphere" || (get2(editConstraint).landingHitboxType || "sphere") === "circle")) $$render(consequent_21);
+                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "cylinder")) $$render(consequent_22, 1);
+                    else $$render(alternate_8, -1);
                   });
                 }
                 reset(div_89);
@@ -24058,7 +24689,7 @@ ${component_stack}
                   if (select_4_value !== (select_4_value = (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHitboxType || "sphere")))) {
                     select_4.value = (select_4.__value = (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHitboxType || "sphere"))) ?? "", select_option(select_4, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHitboxType || "sphere")));
                   }
-                  classes_5 = set_class(button_17, 1, "btn btn-xs svelte-1nhql4u", null, classes_5, {
+                  classes_6 = set_class(button_18, 1, "btn btn-xs svelte-1nhql4u", null, classes_6, {
                     "btn-accent": !(get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample"),
                     "btn-armed": get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample"
                   });
@@ -24069,200 +24700,398 @@ ${component_stack}
                     select_5.value = (select_5.__value = (get2(editConstraint), untrack(() => get2(editConstraint).landingHitboxType || "sphere"))) ?? "", select_option(select_5, (get2(editConstraint), untrack(() => get2(editConstraint).landingHitboxType || "sphere")));
                   }
                 });
-                event("click", button_15, () => beginRaycastPlacement("takeoff"));
+                event("click", button_16, () => beginRaycastPlacement("takeoff"));
                 event("input", input_25, (e) => updateEditField("takeoffCx", e.currentTarget.value));
                 event("input", input_26, (e) => updateEditField("takeoffCy", e.currentTarget.value));
                 event("input", input_27, (e) => updateEditField("takeoffCz", e.currentTarget.value));
                 event("change", select_4, (e) => updateEditField("takeoffHitboxType", e.currentTarget.value));
-                event("click", button_17, () => beginRaycastPlacement("takeoffSample"));
-                event("click", button_19, () => beginRaycastPlacement("landing"));
+                event("click", button_18, () => beginRaycastPlacement("takeoffSample"));
+                event("click", button_20, () => beginRaycastPlacement("landing"));
                 event("input", input_37, (e) => updateEditField("landingCx", e.currentTarget.value));
                 event("input", input_38, (e) => updateEditField("landingCy", e.currentTarget.value));
                 event("input", input_39, (e) => updateEditField("landingCz", e.currentTarget.value));
                 event("change", select_5, (e) => updateEditField("landingHitboxType", e.currentTarget.value));
-                append($$anchor4, fragment_6);
+                append($$anchor4, fragment_7);
               };
-              if_block(node_15, ($$render) => {
-                if (get2(usesJumpArc)) $$render(consequent_20);
+              if_block(node_19, ($$render) => {
+                if (get2(usesJumpArc)) $$render(consequent_23);
               });
             }
-            var node_21 = sibling(node_15, 2);
+            var node_25 = sibling(node_19, 2);
             {
-              var consequent_21 = ($$anchor4) => {
-                var div_106 = root_40();
-                var div_107 = sibling(child(div_106), 2);
+              var consequent_30 = ($$anchor4) => {
+                var div_106 = root_44();
+                var div_107 = child(div_106);
                 var div_108 = child(div_107);
-                var input_46 = sibling(child(div_108), 2);
-                remove_input_defaults(input_46);
+                var text_24 = child(div_108);
                 reset(div_108);
                 var div_109 = sibling(div_108, 2);
-                var input_47 = sibling(child(div_109), 2);
-                remove_input_defaults(input_47);
+                var button_22 = child(div_109);
                 reset(div_109);
                 reset(div_107);
+                var node_26 = sibling(div_107, 2);
+                {
+                  var consequent_24 = ($$anchor5) => {
+                    var div_110 = root_45();
+                    append($$anchor5, div_110);
+                  };
+                  if_block(node_26, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).nodes?.length ?? 0) === 0)) $$render(consequent_24);
+                  });
+                }
+                var node_27 = sibling(node_26, 2);
+                each(
+                  node_27,
+                  1,
+                  () => (get2(editConstraint), untrack(() => get2(editConstraint).nodes ?? [])),
+                  index,
+                  ($$anchor5, node, i) => {
+                    var fragment_11 = root_46();
+                    var div_111 = first_child(fragment_11);
+                    var div_112 = child(div_111);
+                    var div_113 = child(div_112);
+                    var node_28 = child(div_113);
+                    {
+                      var consequent_25 = ($$anchor6) => {
+                        var text_25 = text("\u25CB Node 1 \u2014 Start");
+                        append($$anchor6, text_25);
+                      };
+                      var consequent_26 = ($$anchor6) => {
+                        var text_26 = text();
+                        text_26.nodeValue = `\u25CF Node ${i + 1} \u2014 End`;
+                        append($$anchor6, text_26);
+                      };
+                      var alternate_9 = ($$anchor6) => {
+                        var text_27 = text();
+                        text_27.nodeValue = `\u26D3 Node ${i + 1} \u2014 Arc ${i}\u2192${i + 1}`;
+                        append($$anchor6, text_27);
+                      };
+                      if_block(node_28, ($$render) => {
+                        if (i === 0) $$render(consequent_25);
+                        else if (i, get2(editConstraint), untrack(() => i === get2(editConstraint).nodes.length - 1)) $$render(consequent_26, 1);
+                        else $$render(alternate_9, -1);
+                      });
+                    }
+                    reset(div_113);
+                    var div_114 = sibling(div_113, 2);
+                    var button_23 = child(div_114);
+                    reset(div_114);
+                    reset(div_112);
+                    var div_115 = sibling(div_112, 2);
+                    var div_116 = child(div_115);
+                    var input_46 = sibling(child(div_116), 2);
+                    remove_input_defaults(input_46);
+                    reset(div_116);
+                    var div_117 = sibling(div_116, 2);
+                    var input_47 = sibling(child(div_117), 2);
+                    remove_input_defaults(input_47);
+                    reset(div_117);
+                    var div_118 = sibling(div_117, 2);
+                    var input_48 = sibling(child(div_118), 2);
+                    remove_input_defaults(input_48);
+                    reset(div_118);
+                    reset(div_115);
+                    var div_119 = sibling(div_115, 2);
+                    var select_6 = child(div_119);
+                    each(select_6, 5, () => HITBOX_TYPES, index, ($$anchor6, shape) => {
+                      var option_6 = root_50();
+                      var text_28 = child(option_6, true);
+                      reset(option_6);
+                      var option_6_value = {};
+                      template_effect(() => {
+                        set_text(text_28, get2(shape));
+                        if (option_6_value !== (option_6_value = get2(shape))) {
+                          option_6.value = (option_6.__value = get2(shape)) ?? "";
+                        }
+                      });
+                      append($$anchor6, option_6);
+                    });
+                    reset(select_6);
+                    var select_6_value;
+                    init_select(select_6);
+                    reset(div_119);
+                    var node_29 = sibling(div_119, 2);
+                    {
+                      var consequent_27 = ($$anchor6) => {
+                        var div_120 = root_51();
+                        var input_49 = child(div_120);
+                        remove_input_defaults(input_49);
+                        next(2);
+                        reset(div_120);
+                        template_effect(() => set_value(input_49, (get2(node), untrack(() => get2(node).radius ?? 8))));
+                        event("input", input_49, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { radius: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_120);
+                      };
+                      var consequent_28 = ($$anchor6) => {
+                        var div_121 = root_52();
+                        var div_122 = child(div_121);
+                        var input_50 = sibling(child(div_122), 2);
+                        remove_input_defaults(input_50);
+                        reset(div_122);
+                        var div_123 = sibling(div_122, 2);
+                        var input_51 = sibling(child(div_123), 2);
+                        remove_input_defaults(input_51);
+                        reset(div_123);
+                        reset(div_121);
+                        template_effect(() => {
+                          set_value(input_50, (get2(node), untrack(() => get2(node).radius ?? 8)));
+                          set_value(input_51, (get2(node), untrack(() => get2(node).height ?? 6)));
+                        });
+                        event("input", input_50, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { radius: Number(e.currentTarget.value) }));
+                        event("input", input_51, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { height: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_121);
+                      };
+                      var alternate_10 = ($$anchor6) => {
+                        var div_124 = root_53();
+                        var div_125 = child(div_124);
+                        var input_52 = sibling(child(div_125), 2);
+                        remove_input_defaults(input_52);
+                        reset(div_125);
+                        var div_126 = sibling(div_125, 2);
+                        var input_53 = sibling(child(div_126), 2);
+                        remove_input_defaults(input_53);
+                        reset(div_126);
+                        var div_127 = sibling(div_126, 2);
+                        var input_54 = sibling(child(div_127), 2);
+                        remove_input_defaults(input_54);
+                        reset(div_127);
+                        reset(div_124);
+                        template_effect(() => {
+                          set_value(input_52, (get2(node), untrack(() => get2(node).sizeX ?? 8)));
+                          set_value(input_53, (get2(node), untrack(() => get2(node).sizeY ?? 8)));
+                          set_value(input_54, (get2(node), untrack(() => get2(node).sizeZ ?? 8)));
+                        });
+                        event("input", input_52, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeX: Number(e.currentTarget.value) }));
+                        event("input", input_53, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeY: Number(e.currentTarget.value) }));
+                        event("input", input_54, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeZ: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_124);
+                      };
+                      if_block(node_29, ($$render) => {
+                        if (get2(node), untrack(() => (get2(node).hitboxType || "sphere") === "sphere" || (get2(node).hitboxType || "sphere") === "circle")) $$render(consequent_27);
+                        else if (get2(node), untrack(() => (get2(node).hitboxType || "sphere") === "cylinder")) $$render(consequent_28, 1);
+                        else $$render(alternate_10, -1);
+                      });
+                    }
+                    reset(div_111);
+                    var node_30 = sibling(div_111, 2);
+                    {
+                      var consequent_29 = ($$anchor6) => {
+                        var div_128 = root_54();
+                        var span_16 = child(div_128);
+                        span_16.textContent = `Arc ${i + 1} jump y-vel`;
+                        var input_55 = sibling(span_16, 2);
+                        remove_input_defaults(input_55);
+                        reset(div_128);
+                        template_effect(() => set_value(input_55, (get2(editConstraint), i, untrack(() => get2(editConstraint).arcParams[i]?.jumpYVel ?? 0.072))));
+                        event("input", input_55, (e) => store().updateTrainArcParams(get2(trainEditorTargetId), i, { jumpYVel: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_128);
+                      };
+                      if_block(node_30, ($$render) => {
+                        if (i, get2(editConstraint), untrack(() => i < (get2(editConstraint).arcParams?.length ?? 0))) $$render(consequent_29);
+                      });
+                    }
+                    template_effect(() => {
+                      set_value(input_46, (get2(node), untrack(() => get2(node).cx ?? 0)));
+                      set_value(input_47, (get2(node), untrack(() => get2(node).cy ?? 0)));
+                      set_value(input_48, (get2(node), untrack(() => get2(node).cz ?? 0)));
+                      if (select_6_value !== (select_6_value = (get2(node), untrack(() => get2(node).hitboxType || "sphere")))) {
+                        select_6.value = (select_6.__value = (get2(node), untrack(() => get2(node).hitboxType || "sphere"))) ?? "", select_option(select_6, (get2(node), untrack(() => get2(node).hitboxType || "sphere")));
+                      }
+                    });
+                    event("click", button_23, () => store().removeTrainNode(get2(trainEditorTargetId), i));
+                    event("input", input_46, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cx: Number(e.currentTarget.value) }));
+                    event("input", input_47, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cy: Number(e.currentTarget.value) }));
+                    event("input", input_48, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cz: Number(e.currentTarget.value) }));
+                    event("change", select_6, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { hitboxType: e.currentTarget.value }));
+                    append($$anchor5, fragment_11);
+                  }
+                );
                 reset(div_106);
-                template_effect(() => {
-                  set_value(input_46, (get2(editConstraint), untrack(() => get2(editConstraint).yaw ?? 0)));
-                  set_value(input_47, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
-                });
-                event("input", input_46, (e) => updateEditField("yaw", e.currentTarget.value));
-                event("input", input_47, (e) => updateEditField("toleranceRad", e.currentTarget.value));
+                template_effect(() => set_text(text_24, `Jump Train \u2014 ${(get2(editConstraint), untrack(() => get2(editConstraint).nodes?.length ?? 0)) ?? ""} node${(get2(editConstraint), untrack(() => (get2(editConstraint).nodes?.length ?? 0) === 1 ? "" : "s")) ?? ""}, ${(get2(editConstraint), untrack(() => get2(editConstraint).arcParams?.length ?? 0)) ?? ""} arc${(get2(editConstraint), untrack(() => (get2(editConstraint).arcParams?.length ?? 0) === 1 ? "" : "s")) ?? ""}`));
+                event("click", button_22, () => beginRaycastPlacement("trainNode"));
                 append($$anchor4, div_106);
               };
-              if_block(node_21, ($$render) => {
-                if (get2(showLookDirection)) $$render(consequent_21);
-              });
-            }
-            var node_22 = sibling(node_21, 2);
-            {
-              var consequent_22 = ($$anchor4) => {
-                var div_110 = root_41();
-                var div_111 = sibling(child(div_110), 2);
-                var div_112 = child(div_111);
-                var input_48 = sibling(child(div_112), 2);
-                remove_input_defaults(input_48);
-                reset(div_112);
-                var div_113 = sibling(div_112, 2);
-                var input_49 = sibling(child(div_113), 2);
-                remove_input_defaults(input_49);
-                reset(div_113);
-                reset(div_111);
-                reset(div_110);
-                template_effect(() => {
-                  set_value(input_48, (get2(editConstraint), untrack(() => get2(editConstraint).yawMin ?? -0.6)));
-                  set_value(input_49, (get2(editConstraint), untrack(() => get2(editConstraint).yawMax ?? 0.6)));
-                });
-                event("input", input_48, (e) => updateEditField("yawMin", e.currentTarget.value));
-                event("input", input_49, (e) => updateEditField("yawMax", e.currentTarget.value));
-                append($$anchor4, div_110);
-              };
-              if_block(node_22, ($$render) => {
-                if (get2(showLookRange)) $$render(consequent_22);
-              });
-            }
-            var node_23 = sibling(node_22, 2);
-            {
-              var consequent_23 = ($$anchor4) => {
-                var div_114 = root_42();
-                var div_115 = sibling(child(div_114), 2);
-                var div_116 = child(div_115);
-                var input_50 = sibling(child(div_116), 2);
-                remove_input_defaults(input_50);
-                reset(div_116);
-                var div_117 = sibling(div_116, 2);
-                var input_51 = sibling(child(div_117), 2);
-                remove_input_defaults(input_51);
-                reset(div_117);
-                var div_118 = sibling(div_117, 2);
-                var input_52 = sibling(child(div_118), 2);
-                remove_input_defaults(input_52);
-                reset(div_118);
-                reset(div_115);
-                reset(div_114);
-                template_effect(() => {
-                  set_value(input_50, (get2(editConstraint), untrack(() => get2(editConstraint).targetYaw ?? 0)));
-                  set_value(input_51, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
-                  set_value(input_52, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
-                });
-                event("input", input_50, (e) => updateEditField("targetYaw", e.currentTarget.value));
-                event("input", input_51, (e) => updateEditField("toleranceRad", e.currentTarget.value));
-                event("input", input_52, (e) => updateEditField("minSpeed", e.currentTarget.value));
-                append($$anchor4, div_114);
-              };
-              if_block(node_23, ($$render) => {
-                if (get2(showVelocityDirection)) $$render(consequent_23);
-              });
-            }
-            var node_24 = sibling(node_23, 2);
-            {
-              var consequent_24 = ($$anchor4) => {
-                var div_119 = root_43();
-                var div_120 = sibling(child(div_119), 2);
-                var div_121 = child(div_120);
-                var input_53 = sibling(child(div_121), 2);
-                remove_input_defaults(input_53);
-                reset(div_121);
-                var div_122 = sibling(div_121, 2);
-                var input_54 = sibling(child(div_122), 2);
-                remove_input_defaults(input_54);
-                reset(div_122);
-                reset(div_120);
-                reset(div_119);
-                template_effect(() => {
-                  set_value(input_53, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
-                  set_value(input_54, (get2(editConstraint), untrack(() => get2(editConstraint).maxSpeed ?? 0.02)));
-                });
-                event("input", input_53, (e) => updateEditField("minSpeed", e.currentTarget.value));
-                event("input", input_54, (e) => updateEditField("maxSpeed", e.currentTarget.value));
-                append($$anchor4, div_119);
-              };
-              if_block(node_24, ($$render) => {
-                if (get2(showSpeedWindow)) $$render(consequent_24);
-              });
-            }
-            var node_25 = sibling(node_24, 2);
-            {
-              var consequent_25 = ($$anchor4) => {
-                var div_123 = root_44();
-                var div_124 = sibling(child(div_123), 2);
-                var input_55 = child(div_124);
-                remove_input_defaults(input_55);
-                next(2);
-                reset(div_124);
-                reset(div_123);
-                template_effect(() => set_value(input_55, (get2(editConstraint), untrack(() => get2(editConstraint).maxDeltaRad ?? 0.5))));
-                event("input", input_55, (e) => updateEditField("maxDeltaRad", e.currentTarget.value));
-                append($$anchor4, div_123);
-              };
               if_block(node_25, ($$render) => {
-                if (get2(showTurn)) $$render(consequent_25);
+                if (get2(usesJumpTrain)) $$render(consequent_30);
               });
             }
-            var node_26 = sibling(node_25, 2);
+            var node_31 = sibling(node_25, 2);
             {
-              var consequent_26 = ($$anchor4) => {
-                var div_125 = root_45();
-                var select_6 = sibling(child(div_125), 2);
-                each(select_6, 5, () => REQUIRED_STATES, index, ($$anchor5, requiredState) => {
-                  var option_6 = root_46();
-                  var text_22 = child(option_6, true);
-                  reset(option_6);
-                  var option_6_value = {};
+              var consequent_31 = ($$anchor4) => {
+                var div_129 = root_55();
+                var div_130 = sibling(child(div_129), 2);
+                var div_131 = child(div_130);
+                var input_56 = sibling(child(div_131), 2);
+                remove_input_defaults(input_56);
+                reset(div_131);
+                var div_132 = sibling(div_131, 2);
+                var input_57 = sibling(child(div_132), 2);
+                remove_input_defaults(input_57);
+                reset(div_132);
+                reset(div_130);
+                reset(div_129);
+                template_effect(() => {
+                  set_value(input_56, (get2(editConstraint), untrack(() => get2(editConstraint).yaw ?? 0)));
+                  set_value(input_57, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
+                });
+                event("input", input_56, (e) => updateEditField("yaw", e.currentTarget.value));
+                event("input", input_57, (e) => updateEditField("toleranceRad", e.currentTarget.value));
+                append($$anchor4, div_129);
+              };
+              if_block(node_31, ($$render) => {
+                if (get2(showLookDirection)) $$render(consequent_31);
+              });
+            }
+            var node_32 = sibling(node_31, 2);
+            {
+              var consequent_32 = ($$anchor4) => {
+                var div_133 = root_56();
+                var div_134 = sibling(child(div_133), 2);
+                var div_135 = child(div_134);
+                var input_58 = sibling(child(div_135), 2);
+                remove_input_defaults(input_58);
+                reset(div_135);
+                var div_136 = sibling(div_135, 2);
+                var input_59 = sibling(child(div_136), 2);
+                remove_input_defaults(input_59);
+                reset(div_136);
+                reset(div_134);
+                reset(div_133);
+                template_effect(() => {
+                  set_value(input_58, (get2(editConstraint), untrack(() => get2(editConstraint).yawMin ?? -0.6)));
+                  set_value(input_59, (get2(editConstraint), untrack(() => get2(editConstraint).yawMax ?? 0.6)));
+                });
+                event("input", input_58, (e) => updateEditField("yawMin", e.currentTarget.value));
+                event("input", input_59, (e) => updateEditField("yawMax", e.currentTarget.value));
+                append($$anchor4, div_133);
+              };
+              if_block(node_32, ($$render) => {
+                if (get2(showLookRange)) $$render(consequent_32);
+              });
+            }
+            var node_33 = sibling(node_32, 2);
+            {
+              var consequent_33 = ($$anchor4) => {
+                var div_137 = root_57();
+                var div_138 = sibling(child(div_137), 2);
+                var div_139 = child(div_138);
+                var input_60 = sibling(child(div_139), 2);
+                remove_input_defaults(input_60);
+                reset(div_139);
+                var div_140 = sibling(div_139, 2);
+                var input_61 = sibling(child(div_140), 2);
+                remove_input_defaults(input_61);
+                reset(div_140);
+                var div_141 = sibling(div_140, 2);
+                var input_62 = sibling(child(div_141), 2);
+                remove_input_defaults(input_62);
+                reset(div_141);
+                reset(div_138);
+                reset(div_137);
+                template_effect(() => {
+                  set_value(input_60, (get2(editConstraint), untrack(() => get2(editConstraint).targetYaw ?? 0)));
+                  set_value(input_61, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
+                  set_value(input_62, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
+                });
+                event("input", input_60, (e) => updateEditField("targetYaw", e.currentTarget.value));
+                event("input", input_61, (e) => updateEditField("toleranceRad", e.currentTarget.value));
+                event("input", input_62, (e) => updateEditField("minSpeed", e.currentTarget.value));
+                append($$anchor4, div_137);
+              };
+              if_block(node_33, ($$render) => {
+                if (get2(showVelocityDirection)) $$render(consequent_33);
+              });
+            }
+            var node_34 = sibling(node_33, 2);
+            {
+              var consequent_34 = ($$anchor4) => {
+                var div_142 = root_58();
+                var div_143 = sibling(child(div_142), 2);
+                var div_144 = child(div_143);
+                var input_63 = sibling(child(div_144), 2);
+                remove_input_defaults(input_63);
+                reset(div_144);
+                var div_145 = sibling(div_144, 2);
+                var input_64 = sibling(child(div_145), 2);
+                remove_input_defaults(input_64);
+                reset(div_145);
+                reset(div_143);
+                reset(div_142);
+                template_effect(() => {
+                  set_value(input_63, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
+                  set_value(input_64, (get2(editConstraint), untrack(() => get2(editConstraint).maxSpeed ?? 0.02)));
+                });
+                event("input", input_63, (e) => updateEditField("minSpeed", e.currentTarget.value));
+                event("input", input_64, (e) => updateEditField("maxSpeed", e.currentTarget.value));
+                append($$anchor4, div_142);
+              };
+              if_block(node_34, ($$render) => {
+                if (get2(showSpeedWindow)) $$render(consequent_34);
+              });
+            }
+            var node_35 = sibling(node_34, 2);
+            {
+              var consequent_35 = ($$anchor4) => {
+                var div_146 = root_59();
+                var div_147 = sibling(child(div_146), 2);
+                var input_65 = child(div_147);
+                remove_input_defaults(input_65);
+                next(2);
+                reset(div_147);
+                reset(div_146);
+                template_effect(() => set_value(input_65, (get2(editConstraint), untrack(() => get2(editConstraint).maxDeltaRad ?? 0.5))));
+                event("input", input_65, (e) => updateEditField("maxDeltaRad", e.currentTarget.value));
+                append($$anchor4, div_146);
+              };
+              if_block(node_35, ($$render) => {
+                if (get2(showTurn)) $$render(consequent_35);
+              });
+            }
+            var node_36 = sibling(node_35, 2);
+            {
+              var consequent_36 = ($$anchor4) => {
+                var div_148 = root_60();
+                var select_7 = sibling(child(div_148), 2);
+                each(select_7, 5, () => REQUIRED_STATES, index, ($$anchor5, requiredState) => {
+                  var option_7 = root_61();
+                  var text_29 = child(option_7, true);
+                  reset(option_7);
+                  var option_7_value = {};
                   template_effect(() => {
-                    set_text(text_22, get2(requiredState));
-                    if (option_6_value !== (option_6_value = get2(requiredState))) {
-                      option_6.value = (option_6.__value = get2(requiredState)) ?? "";
+                    set_text(text_29, get2(requiredState));
+                    if (option_7_value !== (option_7_value = get2(requiredState))) {
+                      option_7.value = (option_7.__value = get2(requiredState)) ?? "";
                     }
                   });
-                  append($$anchor5, option_6);
+                  append($$anchor5, option_7);
                 });
-                reset(select_6);
-                var select_6_value;
-                init_select(select_6);
-                reset(div_125);
+                reset(select_7);
+                var select_7_value;
+                init_select(select_7);
+                reset(div_148);
                 template_effect(() => {
-                  if (select_6_value !== (select_6_value = (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded")))) {
-                    select_6.value = (select_6.__value = (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded"))) ?? "", select_option(select_6, (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded")));
+                  if (select_7_value !== (select_7_value = (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded")))) {
+                    select_7.value = (select_7.__value = (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded"))) ?? "", select_option(select_7, (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded")));
                   }
                 });
-                event("change", select_6, (e) => updateEditField("requiredState", e.currentTarget.value));
-                append($$anchor4, div_125);
+                event("change", select_7, (e) => updateEditField("requiredState", e.currentTarget.value));
+                append($$anchor4, div_148);
               };
-              if_block(node_26, ($$render) => {
-                if (get2(showState)) $$render(consequent_26);
+              if_block(node_36, ($$render) => {
+                if (get2(showState)) $$render(consequent_36);
               });
             }
-            var button_21 = sibling(node_26, 2);
-            var node_27 = sibling(button_21, 2);
+            var button_24 = sibling(node_36, 2);
+            var node_37 = sibling(button_24, 2);
             {
-              var consequent_27 = ($$anchor4) => {
-                var div_126 = root_47();
-                var span_15 = sibling(child(div_126), 2);
-                var text_23 = child(span_15);
-                reset(span_15);
-                reset(div_126);
+              var consequent_37 = ($$anchor4) => {
+                var div_149 = root_62();
+                var span_17 = sibling(child(div_149), 2);
+                var text_30 = child(span_17);
+                reset(span_17);
+                reset(div_149);
                 template_effect(
-                  ($0, $1, $2) => set_text(text_23, `${$0 ?? ""},
+                  ($0, $1, $2) => set_text(text_30, `${$0 ?? ""},
                                     ${$1 ?? ""},
                                     ${$2 ?? ""}`),
                   [
@@ -24271,70 +25100,70 @@ ${component_stack}
                     () => (get2(state2), untrack(() => fmt(get2(state2).viewportCursor.point.z)))
                   ]
                 );
-                append($$anchor4, div_126);
+                append($$anchor4, div_149);
               };
-              if_block(node_27, ($$render) => {
-                if (get2(state2), untrack(() => get2(state2).viewportCursor)) $$render(consequent_27);
+              if_block(node_37, ($$render) => {
+                if (get2(state2), untrack(() => get2(state2).viewportCursor)) $$render(consequent_37);
               });
             }
-            var div_127 = sibling(node_27, 2);
-            var div_128 = sibling(child(div_127), 2);
-            var button_22 = child(div_128);
-            var button_23 = sibling(button_22, 2);
-            var button_24 = sibling(button_23, 2);
-            var button_25 = sibling(button_24, 2);
+            var div_150 = sibling(node_37, 2);
+            var div_151 = sibling(child(div_150), 2);
+            var button_25 = child(div_151);
             var button_26 = sibling(button_25, 2);
             var button_27 = sibling(button_26, 2);
-            reset(div_128);
-            reset(div_127);
-            var node_28 = sibling(div_127, 2);
+            var button_28 = sibling(button_27, 2);
+            var button_29 = sibling(button_28, 2);
+            var button_30 = sibling(button_29, 2);
+            reset(div_151);
+            reset(div_150);
+            var node_38 = sibling(div_150, 2);
             {
-              var consequent_29 = ($$anchor4) => {
-                var div_129 = root_48();
-                var span_16 = child(div_129);
-                var b = sibling(child(span_16));
-                var text_24 = child(b, true);
-                reset(b);
-                reset(span_16);
-                var span_17 = sibling(span_16, 2);
-                var b_1 = sibling(child(span_17));
-                var text_25 = child(b_1, true);
+              var consequent_39 = ($$anchor4) => {
+                var div_152 = root_63();
+                var span_18 = child(div_152);
+                var b_1 = sibling(child(span_18));
+                var text_31 = child(b_1, true);
                 reset(b_1);
-                reset(span_17);
-                var span_18 = sibling(span_17, 2);
-                var b_2 = sibling(child(span_18));
-                var text_26 = child(b_2, true);
-                reset(b_2);
                 reset(span_18);
                 var span_19 = sibling(span_18, 2);
-                var b_3 = sibling(child(span_19));
-                var text_27 = child(b_3, true);
-                reset(b_3);
+                var b_2 = sibling(child(span_19));
+                var text_32 = child(b_2, true);
+                reset(b_2);
                 reset(span_19);
-                var node_29 = sibling(span_19, 2);
+                var span_20 = sibling(span_19, 2);
+                var b_3 = sibling(child(span_20));
+                var text_33 = child(b_3, true);
+                reset(b_3);
+                reset(span_20);
+                var span_21 = sibling(span_20, 2);
+                var b_4 = sibling(child(span_21));
+                var text_34 = child(b_4, true);
+                reset(b_4);
+                reset(span_21);
+                var node_39 = sibling(span_21, 2);
                 {
-                  var consequent_28 = ($$anchor5) => {
-                    var span_20 = root_49();
-                    var b_4 = sibling(child(span_20));
-                    var text_28 = child(b_4, true);
-                    reset(b_4);
-                    reset(span_20);
-                    template_effect(($0) => set_text(text_28, $0), [
+                  var consequent_38 = ($$anchor5) => {
+                    var span_22 = root_64();
+                    var b_5 = sibling(child(span_22));
+                    var text_35 = child(b_5, true);
+                    reset(b_5);
+                    reset(span_22);
+                    template_effect(($0) => set_text(text_35, $0), [
                       () => (get2(selected), untrack(() => fmt(get2(selected).constraint.bx)))
                     ]);
-                    append($$anchor5, span_20);
+                    append($$anchor5, span_22);
                   };
-                  if_block(node_29, ($$render) => {
-                    if (get2(selected), untrack(() => get2(selected).constraint.bx !== void 0)) $$render(consequent_28);
+                  if_block(node_39, ($$render) => {
+                    if (get2(selected), untrack(() => get2(selected).constraint.bx !== void 0)) $$render(consequent_38);
                   });
                 }
-                reset(div_129);
+                reset(div_152);
                 template_effect(
                   ($0, $1, $2, $3) => {
-                    set_text(text_24, $0);
-                    set_text(text_25, $1);
-                    set_text(text_26, $2);
-                    set_text(text_27, $3);
+                    set_text(text_31, $0);
+                    set_text(text_32, $1);
+                    set_text(text_33, $2);
+                    set_text(text_34, $3);
                   },
                   [
                     () => (get2(selected), untrack(() => fmt(get2(selected).constraint.cx))),
@@ -24343,112 +25172,101 @@ ${component_stack}
                     () => (get2(selected), untrack(() => fmt(get2(selected).constraint.radius ?? 8)))
                   ]
                 );
-                append($$anchor4, div_129);
+                append($$anchor4, div_152);
               };
-              if_block(node_28, ($$render) => {
-                if (get2(selected), untrack(() => get2(selected).constraint.cx !== void 0)) $$render(consequent_29);
+              if_block(node_38, ($$render) => {
+                if (get2(selected), untrack(() => get2(selected).constraint.cx !== void 0)) $$render(consequent_39);
               });
             }
             reset(div_12);
             template_effect(
               ($0, $1) => {
                 set_style(div_13, `--tc: ${$0 ?? ""}`);
-                set_text(text_13, $1);
-                set_text(text_14, (get2(selected), untrack(() => get2(selected).constraint.type)));
-                classes_4 = set_class(button_7, 1, "btn btn-toggle svelte-1nhql4u", null, classes_4, { enabled: get2(selected).enabled });
-                set_text(text_15, (get2(selected), untrack(() => get2(selected).enabled ? "Enabled" : "Disabled")));
+                set_text(text_15, $1);
+                set_text(text_16, get2(selectedType));
+                classes_5 = set_class(button_8, 1, "btn btn-toggle svelte-1nhql4u", null, classes_5, { enabled: get2(selected).enabled });
+                set_text(text_17, (get2(selected), untrack(() => get2(selected).enabled ? "Enabled" : "Disabled")));
                 set_value(input_1, get2(editLabel));
-                if (select_1_value !== (select_1_value = get2(editType))) {
-                  select_1.value = (select_1.__value = get2(editType)) ?? "", select_option(select_1, get2(editType));
-                }
-                set_value(input_2, (get2(editConstraint), untrack(() => get2(editConstraint).cx ?? 0)));
-                set_value(input_3, (get2(editConstraint), untrack(() => get2(editConstraint).cy ?? 0)));
-                set_value(input_4, (get2(editConstraint), untrack(() => get2(editConstraint).cz ?? 0)));
               },
               [
-                () => (get2(selected), untrack(() => typeColor2(get2(selected).constraint.type))),
-                () => (get2(selected), untrack(() => typeIcon(get2(selected).constraint.type)))
+                () => (get2(selectedType), untrack(() => typeColor2(get2(selectedType)))),
+                () => (get2(selectedType), untrack(() => typeIcon(get2(selectedType))))
               ]
             );
-            event("click", button_7, toggleEnabled);
-            event("click", button_8, () => store().duplicateConstraint(get2(selected).id));
-            event("click", button_9, () => store().deleteConstraint(get2(selected).id));
+            event("click", button_8, toggleEnabled);
+            event("click", button_9, () => store().duplicateConstraint(get2(selected).id));
+            event("click", button_10, () => store().deleteConstraint(get2(selected).id));
             event("input", input_1, (e) => updateEditLabel(e.currentTarget.value));
-            event("change", select_1, (e) => updateEditType(e.currentTarget.value));
-            event("click", button_10, () => beginRaycastPlacement("center"));
-            event("input", input_2, (e) => updateEditField("cx", e.currentTarget.value));
-            event("input", input_3, (e) => updateEditField("cy", e.currentTarget.value));
-            event("input", input_4, (e) => updateEditField("cz", e.currentTarget.value));
-            event("click", button_21, applySelected);
-            event("click", button_22, () => nudge(-1, 0, 0));
-            event("click", button_23, () => nudge(1, 0, 0));
-            event("click", button_24, () => nudge(0, -1, 0));
-            event("click", button_25, () => nudge(0, 1, 0));
-            event("click", button_26, () => nudge(0, 0, -1));
-            event("click", button_27, () => nudge(0, 0, 1));
+            event("click", button_24, applySelected);
+            event("click", button_25, () => nudge(-1, 0, 0));
+            event("click", button_26, () => nudge(1, 0, 0));
+            event("click", button_27, () => nudge(0, -1, 0));
+            event("click", button_28, () => nudge(0, 1, 0));
+            event("click", button_29, () => nudge(0, 0, -1));
+            event("click", button_30, () => nudge(0, 0, 1));
             append($$anchor3, div_12);
           };
-          var alternate_8 = ($$anchor3) => {
-            var div_130 = root_50();
-            append($$anchor3, div_130);
+          var alternate_11 = ($$anchor3) => {
+            var div_153 = root_65();
+            append($$anchor3, div_153);
           };
-          if_block(node_7, ($$render) => {
-            if (get2(selected)) $$render(consequent_30);
-            else $$render(alternate_8, -1);
+          if_block(node_9, ($$render) => {
+            if (get2(selected)) $$render(consequent_40);
+            else $$render(alternate_11, -1);
           });
         }
-        append($$anchor2, fragment_1);
+        append($$anchor2, fragment_2);
       };
-      if_block(node_6, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "edit")) $$render(consequent_31);
+      if_block(node_8, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "edit")) $$render(consequent_41);
       });
     }
-    var node_30 = sibling(node_6, 2);
+    var node_40 = sibling(node_8, 2);
     {
-      var consequent_32 = ($$anchor2) => {
-        var div_131 = root_51();
-        var div_132 = sibling(child(div_131), 2);
-        var div_133 = sibling(child(div_132), 2);
-        var label_1 = child(div_133);
-        var input_56 = child(label_1);
-        remove_input_defaults(input_56);
+      var consequent_42 = ($$anchor2) => {
+        var div_154 = root_66();
+        var div_155 = sibling(child(div_154), 2);
+        var div_156 = sibling(child(div_155), 2);
+        var label_1 = child(div_156);
+        var input_66 = child(label_1);
+        remove_input_defaults(input_66);
         next(4);
         reset(label_1);
         var label_2 = sibling(label_1, 2);
-        var input_57 = child(label_2);
-        remove_input_defaults(input_57);
+        var input_67 = child(label_2);
+        remove_input_defaults(input_67);
         next(4);
         reset(label_2);
         var label_3 = sibling(label_2, 2);
-        var input_58 = child(label_3);
-        remove_input_defaults(input_58);
+        var input_68 = child(label_3);
+        remove_input_defaults(input_68);
         next(4);
         reset(label_3);
         var label_4 = sibling(label_3, 2);
-        var input_59 = child(label_4);
-        remove_input_defaults(input_59);
+        var input_69 = child(label_4);
+        remove_input_defaults(input_69);
         next(4);
         reset(label_4);
-        reset(div_133);
-        reset(div_132);
-        var div_134 = sibling(div_132, 2);
-        var div_135 = child(div_134);
-        var text_29 = child(div_135);
-        reset(div_135);
-        var input_60 = sibling(div_135, 2);
-        remove_input_defaults(input_60);
-        reset(div_134);
-        var div_136 = sibling(div_134, 2);
-        var div_137 = child(div_136);
-        var text_30 = child(div_137);
-        reset(div_137);
-        var input_61 = sibling(div_137, 2);
-        remove_input_defaults(input_61);
-        reset(div_136);
-        var div_138 = sibling(div_136, 2);
-        var div_139 = sibling(child(div_138), 2);
+        reset(div_156);
+        reset(div_155);
+        var div_157 = sibling(div_155, 2);
+        var div_158 = child(div_157);
+        var text_36 = child(div_158);
+        reset(div_158);
+        var input_70 = sibling(div_158, 2);
+        remove_input_defaults(input_70);
+        reset(div_157);
+        var div_159 = sibling(div_157, 2);
+        var div_160 = child(div_159);
+        var text_37 = child(div_160);
+        reset(div_160);
+        var input_71 = sibling(div_160, 2);
+        remove_input_defaults(input_71);
+        reset(div_159);
+        var div_161 = sibling(div_159, 2);
+        var div_162 = sibling(child(div_161), 2);
         each(
-          div_139,
+          div_162,
           4,
           () => [
             ["classic", "Classic", "#58a6ff"],
@@ -24461,83 +25279,83 @@ ${component_stack}
             let id = () => get2($$array_1)[0];
             let label = () => get2($$array_1)[1];
             let dot = () => get2($$array_1)[2];
-            var button_28 = root_52();
-            let classes_6;
-            var span_21 = child(button_28);
-            var text_31 = sibling(span_21);
-            reset(button_28);
+            var button_31 = root_67();
+            let classes_7;
+            var span_23 = child(button_31);
+            var text_38 = sibling(span_23);
+            reset(button_31);
             template_effect(() => {
-              classes_6 = set_class(button_28, 1, "theme-btn svelte-1nhql4u", null, classes_6, { active: get2(state2).visuals.colorTheme === id() });
-              set_style(span_21, `background:${dot() ?? ""}`);
-              set_text(text_31, ` ${label() ?? ""}`);
+              classes_7 = set_class(button_31, 1, "theme-btn svelte-1nhql4u", null, classes_7, { active: get2(state2).visuals.colorTheme === id() });
+              set_style(span_23, `background:${dot() ?? ""}`);
+              set_text(text_38, ` ${label() ?? ""}`);
             });
-            event("click", button_28, () => store().setVisuals({ colorTheme: id() }));
-            append($$anchor3, button_28);
+            event("click", button_31, () => store().setVisuals({ colorTheme: id() }));
+            append($$anchor3, button_31);
           }
         );
-        reset(div_139);
-        reset(div_138);
-        reset(div_131);
+        reset(div_162);
+        reset(div_161);
+        reset(div_154);
         template_effect(
           ($0) => {
-            set_checked(input_56, (get2(state2), untrack(() => get2(state2).visuals.showAll)));
-            set_checked(input_57, (get2(state2), untrack(() => get2(state2).visuals.showOnlySelected)));
-            set_checked(input_58, (get2(state2), untrack(() => get2(state2).visuals.showFlowLines)));
-            set_checked(input_59, (get2(state2), untrack(() => get2(state2).visuals.showLabels)));
-            set_text(text_29, `Opacity \u2014 ${$0 ?? ""}%`);
-            set_value(input_60, (get2(state2), untrack(() => get2(state2).visuals.opacity)));
-            set_text(text_30, `Line Thickness \u2014 ${(get2(state2), untrack(() => get2(state2).visuals.lineThickness)) ?? ""}px`);
-            set_value(input_61, (get2(state2), untrack(() => get2(state2).visuals.lineThickness)));
+            set_checked(input_66, (get2(state2), untrack(() => get2(state2).visuals.showAll)));
+            set_checked(input_67, (get2(state2), untrack(() => get2(state2).visuals.showOnlySelected)));
+            set_checked(input_68, (get2(state2), untrack(() => get2(state2).visuals.showFlowLines)));
+            set_checked(input_69, (get2(state2), untrack(() => get2(state2).visuals.showLabels)));
+            set_text(text_36, `Opacity \u2014 ${$0 ?? ""}%`);
+            set_value(input_70, (get2(state2), untrack(() => get2(state2).visuals.opacity)));
+            set_text(text_37, `Line Thickness \u2014 ${(get2(state2), untrack(() => get2(state2).visuals.lineThickness)) ?? ""}px`);
+            set_value(input_71, (get2(state2), untrack(() => get2(state2).visuals.lineThickness)));
           },
           [
             () => (get2(state2), untrack(() => Math.round(get2(state2).visuals.opacity * 100)))
           ]
         );
-        event("change", input_56, (e) => store().setVisuals({ showAll: e.currentTarget.checked }));
-        event("change", input_57, (e) => store().setVisuals({ showOnlySelected: e.currentTarget.checked }));
-        event("change", input_58, (e) => store().setVisuals({ showFlowLines: e.currentTarget.checked }));
-        event("change", input_59, (e) => store().setVisuals({ showLabels: e.currentTarget.checked }));
-        event("input", input_60, (e) => store().setVisuals({ opacity: Number(e.currentTarget.value) }));
-        event("input", input_61, (e) => store().setVisuals({ lineThickness: Number(e.currentTarget.value) }));
-        append($$anchor2, div_131);
+        event("change", input_66, (e) => store().setVisuals({ showAll: e.currentTarget.checked }));
+        event("change", input_67, (e) => store().setVisuals({ showOnlySelected: e.currentTarget.checked }));
+        event("change", input_68, (e) => store().setVisuals({ showFlowLines: e.currentTarget.checked }));
+        event("change", input_69, (e) => store().setVisuals({ showLabels: e.currentTarget.checked }));
+        event("input", input_70, (e) => store().setVisuals({ opacity: Number(e.currentTarget.value) }));
+        event("input", input_71, (e) => store().setVisuals({ lineThickness: Number(e.currentTarget.value) }));
+        append($$anchor2, div_154);
       };
-      if_block(node_30, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "visuals")) $$render(consequent_32);
+      if_block(node_40, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "visuals")) $$render(consequent_42);
       });
     }
-    var node_31 = sibling(node_30, 2);
+    var node_41 = sibling(node_40, 2);
     {
-      var consequent_34 = ($$anchor2) => {
-        var div_140 = root_53();
-        var div_141 = sibling(child(div_140), 2);
-        var button_29 = child(div_141);
-        var button_30 = sibling(button_29, 2);
-        reset(div_141);
-        var node_32 = sibling(div_141, 2);
+      var consequent_44 = ($$anchor2) => {
+        var div_163 = root_68();
+        var div_164 = sibling(child(div_163), 2);
+        var button_32 = child(div_164);
+        var button_33 = sibling(button_32, 2);
+        reset(div_164);
+        var node_42 = sibling(div_164, 2);
         {
-          var consequent_33 = ($$anchor3) => {
-            var div_142 = root_54();
-            append($$anchor3, div_142);
+          var consequent_43 = ($$anchor3) => {
+            var div_165 = root_69();
+            append($$anchor3, div_165);
           };
-          var alternate_9 = ($$anchor3) => {
-            var div_143 = root_55();
-            each(div_143, 5, () => (get2(state2), untrack(() => get2(state2).savedPositions)), index, ($$anchor4, pos, idx) => {
-              var div_144 = root_56();
-              var div_145 = child(div_144);
-              var text_32 = child(div_145, true);
-              reset(div_145);
-              var div_146 = sibling(div_145, 2);
-              var text_33 = child(div_146);
-              reset(div_146);
-              var div_147 = sibling(div_146, 2);
-              var button_31 = child(div_147);
-              var button_32 = sibling(button_31, 2);
-              reset(div_147);
-              reset(div_144);
+          var alternate_12 = ($$anchor3) => {
+            var div_166 = root_70();
+            each(div_166, 5, () => (get2(state2), untrack(() => get2(state2).savedPositions)), index, ($$anchor4, pos, idx) => {
+              var div_167 = root_71();
+              var div_168 = child(div_167);
+              var text_39 = child(div_168, true);
+              reset(div_168);
+              var div_169 = sibling(div_168, 2);
+              var text_40 = child(div_169);
+              reset(div_169);
+              var div_170 = sibling(div_169, 2);
+              var button_34 = child(div_170);
+              var button_35 = sibling(button_34, 2);
+              reset(div_170);
+              reset(div_167);
               template_effect(
                 ($0, $1, $2) => {
-                  set_text(text_32, (get2(pos), idx, untrack(() => get2(pos).name || `Position ${idx + 1}`)));
-                  set_text(text_33, `${$0 ?? ""}, ${$1 ?? ""}, ${$2 ?? ""}`);
+                  set_text(text_39, (get2(pos), idx, untrack(() => get2(pos).name || `Position ${idx + 1}`)));
+                  set_text(text_40, `${$0 ?? ""}, ${$1 ?? ""}, ${$2 ?? ""}`);
                 },
                 [
                   () => (get2(pos), untrack(() => fmt(get2(pos).x))),
@@ -24545,20 +25363,20 @@ ${component_stack}
                   () => (get2(pos), untrack(() => fmt(get2(pos).z)))
                 ]
               );
-              event("click", button_31, () => store().moveSelectedTo(Number(get2(pos).x), Number(get2(pos).y), Number(get2(pos).z)));
-              event("click", button_32, () => store().deleteSavedPosition(idx));
-              append($$anchor4, div_144);
+              event("click", button_34, () => store().moveSelectedTo(Number(get2(pos).x), Number(get2(pos).y), Number(get2(pos).z)));
+              event("click", button_35, () => store().deleteSavedPosition(idx));
+              append($$anchor4, div_167);
             });
-            reset(div_143);
-            append($$anchor3, div_143);
+            reset(div_166);
+            append($$anchor3, div_166);
           };
-          if_block(node_32, ($$render) => {
-            if (get2(state2), untrack(() => get2(state2).savedPositions.length === 0)) $$render(consequent_33);
-            else $$render(alternate_9, -1);
+          if_block(node_42, ($$render) => {
+            if (get2(state2), untrack(() => get2(state2).savedPositions.length === 0)) $$render(consequent_43);
+            else $$render(alternate_12, -1);
           });
         }
-        reset(div_140);
-        event("click", button_29, () => {
+        reset(div_163);
+        event("click", button_32, () => {
           if (!get2(state2).viewportCursor) return;
           store().addSavedPosition({
             name: `Cursor ${(/* @__PURE__ */ new Date()).toLocaleTimeString()}`,
@@ -24567,7 +25385,7 @@ ${component_stack}
             z: get2(state2).viewportCursor.point.z
           });
         });
-        event("click", button_30, () => {
+        event("click", button_33, () => {
           if (!get2(selected)) return;
           store().addSavedPosition({
             name: `${get2(selected).label} center`,
@@ -24576,69 +25394,69 @@ ${component_stack}
             z: get2(selected).constraint.cz
           });
         });
-        append($$anchor2, div_140);
+        append($$anchor2, div_163);
       };
-      if_block(node_31, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "positions")) $$render(consequent_34);
+      if_block(node_41, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "positions")) $$render(consequent_44);
       });
     }
-    var node_33 = sibling(node_31, 2);
+    var node_43 = sibling(node_41, 2);
     {
-      var consequent_36 = ($$anchor2) => {
-        var div_148 = root_57();
-        var div_149 = sibling(child(div_148), 2);
-        var textarea = sibling(child(div_149), 2);
+      var consequent_46 = ($$anchor2) => {
+        var div_171 = root_72();
+        var div_172 = sibling(child(div_171), 2);
+        var textarea = sibling(child(div_172), 2);
         remove_textarea_child(textarea);
-        var div_150 = sibling(textarea, 2);
-        var button_33 = child(div_150);
-        reset(div_150);
-        reset(div_149);
-        var div_151 = sibling(div_149, 2);
-        var button_34 = child(div_151);
-        var button_35 = sibling(button_34, 2);
-        let classes_7;
-        var text_34 = child(button_35, true);
-        reset(button_35);
-        var button_36 = sibling(button_35, 2);
-        var label_5 = sibling(button_36, 2);
-        var input_62 = sibling(child(label_5));
+        var div_173 = sibling(textarea, 2);
+        var button_36 = child(div_173);
+        reset(div_173);
+        reset(div_172);
+        var div_174 = sibling(div_172, 2);
+        var button_37 = child(div_174);
+        var button_38 = sibling(button_37, 2);
+        let classes_8;
+        var text_41 = child(button_38, true);
+        reset(button_38);
+        var button_39 = sibling(button_38, 2);
+        var label_5 = sibling(button_39, 2);
+        var input_72 = sibling(child(label_5));
         reset(label_5);
-        var button_37 = sibling(label_5, 2);
-        reset(div_151);
-        var div_152 = sibling(div_151, 2);
-        var textarea_1 = sibling(child(div_152), 2);
+        var button_40 = sibling(label_5, 2);
+        reset(div_174);
+        var div_175 = sibling(div_174, 2);
+        var textarea_1 = sibling(child(div_175), 2);
         remove_textarea_child(textarea_1);
-        reset(div_152);
-        var div_153 = sibling(div_152, 2);
-        var span_22 = child(div_153);
-        var text_35 = child(span_22);
-        reset(span_22);
-        var span_23 = sibling(span_22, 4);
-        var text_36 = child(span_23);
-        reset(span_23);
-        var node_34 = sibling(span_23, 2);
+        reset(div_175);
+        var div_176 = sibling(div_175, 2);
+        var span_24 = child(div_176);
+        var text_42 = child(span_24);
+        reset(span_24);
+        var span_25 = sibling(span_24, 4);
+        var text_43 = child(span_25);
+        reset(span_25);
+        var node_44 = sibling(span_25, 2);
         {
-          var consequent_35 = ($$anchor3) => {
-            var span_24 = root_58();
-            append($$anchor3, span_24);
+          var consequent_45 = ($$anchor3) => {
+            var span_26 = root_73();
+            append($$anchor3, span_26);
           };
-          if_block(node_34, ($$render) => {
-            if (get2(state2), untrack(() => get2(state2).dirty)) $$render(consequent_35);
+          if_block(node_44, ($$render) => {
+            if (get2(state2), untrack(() => get2(state2).dirty)) $$render(consequent_45);
           });
         }
-        reset(div_153);
-        reset(div_148);
+        reset(div_176);
+        reset(div_171);
         template_effect(() => {
           set_value(textarea, (get2(state2), untrack(() => get2(state2).ui.mapImportText || "")));
-          classes_7 = set_class(button_35, 1, "btn btn-sm svelte-1nhql4u", null, classes_7, { feedback: get2(copyFeedback) });
-          set_text(text_34, get2(copyFeedback) ? "\u2713 Copied!" : "\u2398 Copy JSON");
-          set_text(text_35, `${(get2(state2), untrack(() => get2(state2).constraints.length)) ?? ""} constraints`);
-          set_text(text_36, `Map: ${(get2(state2), untrack(() => get2(state2).editorIntegration.mapRef || "unknown")) ?? ""}`);
+          classes_8 = set_class(button_38, 1, "btn btn-sm svelte-1nhql4u", null, classes_8, { feedback: get2(copyFeedback) });
+          set_text(text_41, get2(copyFeedback) ? "\u2713 Copied!" : "\u2398 Copy JSON");
+          set_text(text_42, `${(get2(state2), untrack(() => get2(state2).constraints.length)) ?? ""} constraints`);
+          set_text(text_43, `Map: ${(get2(state2), untrack(() => get2(state2).editorIntegration.mapRef || "unknown")) ?? ""}`);
         });
         event("input", textarea, (e) => updateMapImportText(e.currentTarget.value));
         event("keydown", textarea, onMapImportKeydown);
-        event("click", button_33, runMapAutoImport);
-        event("click", button_34, () => exportConstraintDocument({
+        event("click", button_36, runMapAutoImport);
+        event("click", button_37, () => exportConstraintDocument({
           mapRef: get2(state2).editorIntegration.mapRef,
           name: `${get2(state2).editorIntegration.mapRef || "map"} constraints`,
           constraints: get2(state2).constraints,
@@ -24647,17 +25465,17 @@ ${component_stack}
           ui: get2(state2).ui,
           selectedConstraintId: get2(state2).selectedConstraintId
         }));
-        event("click", button_35, copyJson);
-        event("click", button_36, loadJsonText);
-        event("change", input_62, onImportFile);
-        event("click", button_37, () => {
+        event("click", button_38, copyJson);
+        event("click", button_39, loadJsonText);
+        event("change", input_72, onImportFile);
+        event("click", button_40, () => {
           if (confirm(`Clear all ${get2(state2).constraints.length} constraints?`)) store().clearAllConstraints();
         });
         bind_value(textarea_1, () => get2(jsonText), ($$value) => set(jsonText, $$value));
-        append($$anchor2, div_148);
+        append($$anchor2, div_171);
       };
-      if_block(node_33, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "io")) $$render(consequent_36);
+      if_block(node_43, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "io")) $$render(consequent_46);
       });
     }
     reset(div_11);
@@ -24667,24 +25485,26 @@ ${component_stack}
       classes = set_class(span, 1, "map-dot svelte-1nhql4u", null, classes, { ready: get2(state2).editorIntegration.sceneReady });
       set_text(text2, (get2(state2), untrack(() => get2(state2).editorIntegration.mapRef || "unknown-map")));
       set_text(text_1, (get2(state2), untrack(() => get2(state2).toolMode)));
-      classes_1 = set_class(button_2, 1, "btn btn-raycast svelte-1nhql4u", null, classes_1, { armed: get2(state2).placementArmed });
+      classes_1 = set_class(button_2, 1, "btn btn-train svelte-1nhql4u", null, classes_1, { armed: !!get2(state2).trainPlacementGroupId });
+      classes_2 = set_class(button_3, 1, "btn btn-raycast svelte-1nhql4u", null, classes_2, { armed: get2(state2).placementArmed });
       set_value(input, (get2(state2), untrack(() => get2(state2).ui.listFilter || "")));
-      set_text(text_4, `${(get2(state2), untrack(() => get2(state2).constraints.length)) ?? ""} total`);
-      set_text(text_5, `${get2(enabledCount) ?? ""} on`);
+      set_text(text_5, `${get2(visibleCount) ?? ""} total`);
+      set_text(text_6, `${get2(enabledCount) ?? ""} on`);
     });
     event("click", button, function(...$$args) {
       onClose()?.apply(this, $$args);
     });
     bind_select_value(select, () => get2(newType), ($$value) => set(newType, $$value));
     event("click", button_1, () => addConstraint(get2(newType)));
-    event("click", button_2, beginRaycastPlacement);
+    event("click", button_2, startJumpTrainMode);
+    event("click", button_3, beginRaycastPlacement);
     event("input", input, (e) => store().setUiState({ listFilter: e.currentTarget.value }));
     event("dragover", div_9, preventDefault(function($$arg) {
       bubble_event.call(this, $$props, $$arg);
     }));
     event("drop", div_9, onDropToEnd);
-    event("click", button_5, () => store().undo());
-    event("click", button_6, () => store().redo());
+    event("click", button_6, () => store().undo());
+    event("click", button_7, () => store().redo());
     append($$anchor, div);
     pop();
   }
@@ -24805,14 +25625,23 @@ ${component_stack}
         if (id) {
           store.deleteConstraint(id);
         }
+      } else if (k === "t") {
+        store.startJumpTrain();
+        setOpen(false);
       } else if (event2.key === "Escape") {
-        if (store.getState().placementArmed) {
+        if (store.getState().trainPlacementGroupId) {
+          store.finishJumpTrain();
+          setOpen(true);
+        } else if (store.getState().placementArmed) {
           store.setPlacementArmed(false);
           store.setPlacementTarget("center");
           store.setToolMode("select");
         } else {
           setOpen(false);
         }
+      } else if (event2.key === "Enter" && store.getState().trainPlacementGroupId) {
+        store.finishJumpTrain();
+        setOpen(true);
       } else if (k === "d" && event2.ctrlKey) {
         const id = store.getState().selectedConstraintId;
         if (id) {
@@ -24827,6 +25656,15 @@ ${component_stack}
     document.addEventListener("keydown", onKeydown, true);
     const unsubscribePick = hooks.subscribePick((hit, event2) => {
       const state2 = store.getState();
+      if (state2.placementArmed && state2.placementTarget === "trainNode" && state2.trainPlacementGroupId) {
+        event2.preventDefault();
+        event2.stopPropagation();
+        if (typeof event2.stopImmediatePropagation === "function") {
+          event2.stopImmediatePropagation();
+        }
+        store.addTrainNode(hit.point);
+        return true;
+      }
       if (!state2.placementArmed || !state2.selectedConstraintId) {
         return;
       }
@@ -24967,6 +25805,7 @@ ${component_stack}
       LineSegment: 4120713,
       Corridor: 2936698,
       JumpArc: 3404031,
+      JumpTrain: 16750899,
       TakeoffZone: 3404031,
       LandingZone: 8452095,
       AirborneSegment: 12616959,
@@ -24984,6 +25823,7 @@ ${component_stack}
       LineSegment: 65348,
       Corridor: 56627,
       JumpArc: 65535,
+      JumpTrain: 16746496,
       TakeoffZone: 65535,
       LandingZone: 8978431,
       AirborneSegment: 16711935,
@@ -25001,6 +25841,7 @@ ${component_stack}
       LineSegment: 12303291,
       Corridor: 11184810,
       JumpArc: 15658734,
+      JumpTrain: 15263976,
       TakeoffZone: 14737632,
       LandingZone: 13684944,
       AirborneSegment: 10066329,
@@ -25320,6 +26161,14 @@ ${component_stack}
     g.add(makeSpeedLabel());
     return g;
   }
+  function makeJumpTrainHelper() {
+    const g = new Group();
+    g.userData.nodeGroups = [];
+    g.userData.arcLines = [];
+    g.userData.tetherLines = [];
+    g.userData.speedLabels = [];
+    return g;
+  }
   function createTypedHelper(record, theme) {
     const type = record.constraint.type;
     const color = typeColor(type, theme);
@@ -25337,6 +26186,8 @@ ${component_stack}
           return makeLineHelper(color);
         case "JumpArc":
           return makeJumpArcHelper(color);
+        case "JumpTrain":
+          return makeJumpTrainHelper();
         case "LookDirection":
         case "LookRange":
         case "VelocityDirection":
@@ -25406,6 +26257,14 @@ ${component_stack}
           numberOr(c.takeoffCy, c.cy),
           numberOr(c.takeoffCz, c.cz)
         );
+      case "JumpTrain": {
+        const last = c.nodes && c.nodes.length > 0 ? c.nodes[c.nodes.length - 1] : null;
+        return last ? new Vector3(last.cx, last.cy, last.cz) : new Vector3(
+          numberOr(c.cx, 0),
+          numberOr(c.cy, 0),
+          numberOr(c.cz, 0)
+        );
+      }
       default:
         return new Vector3(
           numberOr(c.cx, 0),
@@ -25446,6 +26305,13 @@ ${component_stack}
     };
     if (type === "JumpArc") {
       helper.position.set(takeoffCenter.x, takeoffCenter.y, takeoffCenter.z);
+    } else if (type === "JumpTrain") {
+      const nodes = record.constraint.nodes;
+      if (nodes && nodes.length > 0) {
+        helper.position.set(nodes[0].cx, nodes[0].cy, nodes[0].cz);
+      } else {
+        helper.position.set(center.x, center.y, center.z);
+      }
     } else if (type === "LineSegment" || type === "Corridor" || type === "AirborneSegment") {
       helper.position.set(
         numberOr(record.constraint.ax, center.x),
@@ -25641,6 +26507,145 @@ ${component_stack}
         }
         break;
       }
+      case "JumpTrain": {
+        const nodes = record.constraint.nodes || [];
+        const arcParams = record.constraint.arcParams || [];
+        const nodeGroups = helper.userData.nodeGroups;
+        const arcLines = helper.userData.arcLines;
+        const tetherLines = helper.userData.tetherLines;
+        const speedLabels = helper.userData.speedLabels;
+        while (nodeGroups.length < nodes.length) {
+          const idx = nodeGroups.length;
+          const zg = createZoneVisual(color, `trainNode_${idx}`);
+          enforceOverlayRender(zg);
+          setColor(zg, color, opacity, visuals.xrayMode !== false);
+          helper.add(zg);
+          nodeGroups.push(zg);
+        }
+        while (nodeGroups.length > nodes.length) {
+          const zg = nodeGroups.pop();
+          helper.remove(zg);
+          disposeObject3D(zg);
+        }
+        const arcCount = Math.max(0, nodes.length - 1);
+        while (arcLines.length < arcCount) {
+          const line = new Line(
+            new BufferGeometry().setFromPoints([
+              new Vector3(0, 0, 0),
+              new Vector3(0, 2, 0)
+            ]),
+            lineMat(color, 1)
+          );
+          line.name = `trainArc_${arcLines.length}`;
+          line.frustumCulled = false;
+          line.material.depthWrite = false;
+          line.material.needsUpdate = true;
+          enforceOverlayRender(line);
+          helper.add(line);
+          arcLines.push(line);
+        }
+        while (arcLines.length > arcCount) {
+          const line = arcLines.pop();
+          helper.remove(line);
+          disposeObject3D(line);
+        }
+        while (tetherLines.length < arcCount) {
+          const line = new Line(
+            new BufferGeometry().setFromPoints([
+              new Vector3(0, 0, 0),
+              new Vector3(0, 0, 4)
+            ]),
+            lineMat(16777215, 0.5)
+          );
+          line.name = `trainTether_${tetherLines.length}`;
+          line.frustumCulled = false;
+          line.material.depthWrite = false;
+          line.material.needsUpdate = true;
+          enforceOverlayRender(line);
+          helper.add(line);
+          tetherLines.push(line);
+        }
+        while (tetherLines.length > arcCount) {
+          const line = tetherLines.pop();
+          helper.remove(line);
+          disposeObject3D(line);
+        }
+        while (speedLabels.length < arcCount) {
+          const label = makeSpeedLabel();
+          label.name = `trainSpeed_${speedLabels.length}`;
+          label.renderOrder = 10001;
+          label.frustumCulled = false;
+          enforceOverlayRender(label, 10001);
+          helper.add(label);
+          speedLabels.push(label);
+        }
+        while (speedLabels.length > arcCount) {
+          const label = speedLabels.pop();
+          helper.remove(label);
+          disposeObject3D(label);
+        }
+        if (nodes.length === 0) break;
+        const origin = nodes[0];
+        for (let i = 0; i < nodes.length; i++) {
+          const n = nodes[i];
+          const zg = nodeGroups[i];
+          zg.position.set(n.cx - origin.cx, n.cy - origin.cy, n.cz - origin.cz);
+          updateZoneVisual(zg, n.hitboxType, {
+            radius: n.radius,
+            height: n.height,
+            sizeX: n.sizeX,
+            sizeY: n.sizeY,
+            sizeZ: n.sizeZ
+          });
+          setColor(zg, color, opacity, visuals.xrayMode !== false);
+        }
+        for (let i = 0; i < arcCount; i++) {
+          const n0 = nodes[i];
+          const n1 = nodes[i + 1];
+          const jumpYVel = Math.max(
+            1e-3,
+            numberOr(arcParams[i]?.jumpYVel, 0.072)
+          );
+          const start = {
+            x: n0.cx - origin.cx,
+            y: n0.cy - origin.cy,
+            z: n0.cz - origin.cz
+          };
+          const end = {
+            x: n1.cx - origin.cx,
+            y: n1.cy - origin.cy,
+            z: n1.cz - origin.cz
+          };
+          const arcResult = computeJumpArc(start, end, jumpYVel);
+          if (arcResult.points.length >= 2) {
+            arcLines[i].geometry.setFromPoints(arcResult.points);
+            arcLines[i].geometry.computeBoundingSphere();
+            arcLines[i].visible = true;
+          } else {
+            arcLines[i].visible = false;
+          }
+          tetherLines[i].geometry.setFromPoints([
+            new Vector3(start.x, start.y, start.z),
+            new Vector3(end.x, end.y, end.z)
+          ]);
+          tetherLines[i].geometry.computeBoundingSphere();
+          tetherLines[i].visible = true;
+          if (arcResult.points.length > 0) {
+            const apex = arcResult.points.reduce((a, b) => a.y > b.y ? a : b);
+            speedLabels[i].position.copy(apex).add(new Vector3(0, 1.5, 0));
+            if (arcResult.impossible) {
+              updateSpeedLabel(speedLabels[i], "IMPOSSIBLE", 16729156);
+            } else {
+              updateSpeedLabel(
+                speedLabels[i],
+                `spd ${(arcResult.speed * 1e3).toFixed(2)}`,
+                typeColor(type, visuals.colorTheme)
+              );
+            }
+          }
+        }
+        break;
+      }
       case "LookDirection":
       case "LookRange":
       case "VelocityDirection": {
@@ -25751,6 +26756,22 @@ ${component_stack}
         const jumpYVel = Math.max(1e-3, numberOr(c.jumpYVel, 0.072));
         for (const p of computeJumpArc(start, end, jumpYVel).points) {
           points.push(p);
+        }
+      } else if (c.type === "JumpTrain" && Array.isArray(c.nodes) && c.nodes.length >= 2) {
+        for (let i = 0; i < c.nodes.length - 1; i++) {
+          const n0 = c.nodes[i];
+          const n1 = c.nodes[i + 1];
+          const jumpYVel = Math.max(
+            1e-3,
+            numberOr(c.arcParams?.[i]?.jumpYVel, 0.072)
+          );
+          for (const p of computeJumpArc(
+            { x: n0.cx, y: n0.cy, z: n0.cz },
+            { x: n1.cx, y: n1.cy, z: n1.cz },
+            jumpYVel
+          ).points) {
+            points.push(p);
+          }
         }
       } else {
         points.push(flowAnchor(r));

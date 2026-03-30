@@ -8,6 +8,7 @@ const PALETTES = {
     LineSegment: 0x3ee089,
     Corridor: 0x2ccf7a,
     JumpArc: 0x33f0ff,
+    JumpTrain: 0xff9933,
     TakeoffZone: 0x33f0ff,
     LandingZone: 0x80f7ff,
     AirborneSegment: 0xc084ff,
@@ -25,6 +26,7 @@ const PALETTES = {
     LineSegment: 0x00ff44,
     Corridor: 0x00dd33,
     JumpArc: 0x00ffff,
+    JumpTrain: 0xff8800,
     TakeoffZone: 0x00ffff,
     LandingZone: 0x88ffff,
     AirborneSegment: 0xff00ff,
@@ -42,6 +44,7 @@ const PALETTES = {
     LineSegment: 0xbbbbbb,
     Corridor: 0xaaaaaa,
     JumpArc: 0xeeeeee,
+    JumpTrain: 0xe8e8e8,
     TakeoffZone: 0xe0e0e0,
     LandingZone: 0xd0d0d0,
     AirborneSegment: 0x999999,
@@ -381,6 +384,15 @@ function makeJumpArcHelper(color) {
   return g;
 }
 
+function makeJumpTrainHelper() {
+  const g = new THREE.Group();
+  g.userData.nodeGroups = [];
+  g.userData.arcLines = [];
+  g.userData.tetherLines = [];
+  g.userData.speedLabels = [];
+  return g;
+}
+
 function makeAirborneSegmentHelper(color) {
   const g = new THREE.Group();
   for (const name of ["p0", "p1"]) {
@@ -431,6 +443,8 @@ function createTypedHelper(record, theme) {
         return makeLineHelper(color);
       case "JumpArc":
         return makeJumpArcHelper(color);
+      case "JumpTrain":
+        return makeJumpTrainHelper();
       case "LookDirection":
       case "LookRange":
       case "VelocityDirection":
@@ -503,6 +517,17 @@ function flowAnchor(record) {
         numberOr(c.takeoffCy, c.cy),
         numberOr(c.takeoffCz, c.cz),
       );
+    case "JumpTrain": {
+      const last =
+        c.nodes && c.nodes.length > 0 ? c.nodes[c.nodes.length - 1] : null;
+      return last
+        ? new THREE.Vector3(last.cx, last.cy, last.cz)
+        : new THREE.Vector3(
+            numberOr(c.cx, 0),
+            numberOr(c.cy, 0),
+            numberOr(c.cz, 0),
+          );
+    }
     default:
       return new THREE.Vector3(
         numberOr(c.cx, 0),
@@ -512,7 +537,14 @@ function flowAnchor(record) {
   }
 }
 
-function updateHelper(helper, record, selected, visuals, previewCursor = null, sampleCursor = null) {
+function updateHelper(
+  helper,
+  record,
+  selected,
+  visuals,
+  previewCursor = null,
+  sampleCursor = null,
+) {
   const type = record.constraint.type;
   const opacity = Math.max(0.05, Math.min(1, visuals.opacity ?? 0.9));
   const color = selected
@@ -551,6 +583,13 @@ function updateHelper(helper, record, selected, visuals, previewCursor = null, s
 
   if (type === "JumpArc") {
     helper.position.set(takeoffCenter.x, takeoffCenter.y, takeoffCenter.z);
+  } else if (type === "JumpTrain") {
+    const nodes = record.constraint.nodes;
+    if (nodes && nodes.length > 0) {
+      helper.position.set(nodes[0].cx, nodes[0].cy, nodes[0].cz);
+    } else {
+      helper.position.set(center.x, center.y, center.z);
+    }
   } else if (
     type === "LineSegment" ||
     type === "Corridor" ||
@@ -730,7 +769,8 @@ function updateHelper(helper, record, selected, visuals, previewCursor = null, s
 
       const sampleDot = helper.getObjectByName("takeoffSampleDot");
       if (sampleDot) {
-        const hasSample = livePoint || Number.isFinite(record.constraint.takeoffSampleCx);
+        const hasSample =
+          livePoint || Number.isFinite(record.constraint.takeoffSampleCx);
         sampleDot.visible = !!hasSample;
         if (hasSample) sampleDot.position.copy(arcStart);
       }
@@ -762,6 +802,154 @@ function updateHelper(helper, record, selected, visuals, previewCursor = null, s
             `spd ${(arcResult.speed * 1000).toFixed(2)}`,
             typeColor(type, visuals.colorTheme),
           );
+        }
+      }
+      break;
+    }
+    case "JumpTrain": {
+      const nodes = record.constraint.nodes || [];
+      const arcParams = record.constraint.arcParams || [];
+      const nodeGroups = helper.userData.nodeGroups;
+      const arcLines = helper.userData.arcLines;
+      const tetherLines = helper.userData.tetherLines;
+      const speedLabels = helper.userData.speedLabels;
+
+      while (nodeGroups.length < nodes.length) {
+        const idx = nodeGroups.length;
+        const zg = createZoneVisual(color, `trainNode_${idx}`);
+        enforceOverlayRender(zg);
+        setColor(zg, color, opacity, visuals.xrayMode !== false);
+        helper.add(zg);
+        nodeGroups.push(zg);
+      }
+      while (nodeGroups.length > nodes.length) {
+        const zg = nodeGroups.pop();
+        helper.remove(zg);
+        disposeObject3D(zg);
+      }
+
+      const arcCount = Math.max(0, nodes.length - 1);
+      while (arcLines.length < arcCount) {
+        const line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(0, 2, 0),
+          ]),
+          lineMat(color, 1),
+        );
+        line.name = `trainArc_${arcLines.length}`;
+        line.frustumCulled = false;
+        line.material.depthWrite = false;
+        line.material.needsUpdate = true;
+        enforceOverlayRender(line);
+        helper.add(line);
+        arcLines.push(line);
+      }
+      while (arcLines.length > arcCount) {
+        const line = arcLines.pop();
+        helper.remove(line);
+        disposeObject3D(line);
+      }
+
+      while (tetherLines.length < arcCount) {
+        const line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(0, 0, 4),
+          ]),
+          lineMat(0xffffff, 0.5),
+        );
+        line.name = `trainTether_${tetherLines.length}`;
+        line.frustumCulled = false;
+        line.material.depthWrite = false;
+        line.material.needsUpdate = true;
+        enforceOverlayRender(line);
+        helper.add(line);
+        tetherLines.push(line);
+      }
+      while (tetherLines.length > arcCount) {
+        const line = tetherLines.pop();
+        helper.remove(line);
+        disposeObject3D(line);
+      }
+
+      while (speedLabels.length < arcCount) {
+        const label = makeSpeedLabel();
+        label.name = `trainSpeed_${speedLabels.length}`;
+        label.renderOrder = 10001;
+        label.frustumCulled = false;
+        enforceOverlayRender(label, 10001);
+        helper.add(label);
+        speedLabels.push(label);
+      }
+      while (speedLabels.length > arcCount) {
+        const label = speedLabels.pop();
+        helper.remove(label);
+        disposeObject3D(label);
+      }
+
+      if (nodes.length === 0) break;
+
+      const origin = nodes[0];
+
+      for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        const zg = nodeGroups[i];
+        zg.position.set(n.cx - origin.cx, n.cy - origin.cy, n.cz - origin.cz);
+        updateZoneVisual(zg, n.hitboxType, {
+          radius: n.radius,
+          height: n.height,
+          sizeX: n.sizeX,
+          sizeY: n.sizeY,
+          sizeZ: n.sizeZ,
+        });
+        setColor(zg, color, opacity, visuals.xrayMode !== false);
+      }
+
+      for (let i = 0; i < arcCount; i++) {
+        const n0 = nodes[i];
+        const n1 = nodes[i + 1];
+        const jumpYVel = Math.max(
+          0.001,
+          numberOr(arcParams[i]?.jumpYVel, 0.072),
+        );
+        const start = {
+          x: n0.cx - origin.cx,
+          y: n0.cy - origin.cy,
+          z: n0.cz - origin.cz,
+        };
+        const end = {
+          x: n1.cx - origin.cx,
+          y: n1.cy - origin.cy,
+          z: n1.cz - origin.cz,
+        };
+        const arcResult = computeJumpArc(start, end, jumpYVel);
+        if (arcResult.points.length >= 2) {
+          arcLines[i].geometry.setFromPoints(arcResult.points);
+          arcLines[i].geometry.computeBoundingSphere();
+          arcLines[i].visible = true;
+        } else {
+          arcLines[i].visible = false;
+        }
+        tetherLines[i].geometry.setFromPoints([
+          new THREE.Vector3(start.x, start.y, start.z),
+          new THREE.Vector3(end.x, end.y, end.z),
+        ]);
+        tetherLines[i].geometry.computeBoundingSphere();
+        tetherLines[i].visible = true;
+
+        if (arcResult.points.length > 0) {
+          const apex = arcResult.points.reduce((a, b) => (a.y > b.y ? a : b));
+          speedLabels[i].position.copy(apex).add(new THREE.Vector3(0, 1.5, 0));
+          if (arcResult.impossible) {
+            updateSpeedLabel(speedLabels[i], "IMPOSSIBLE", 0xff4444);
+          } else {
+            updateSpeedLabel(
+              speedLabels[i],
+              `spd ${(arcResult.speed * 1000).toFixed(2)}`,
+              typeColor(type, visuals.colorTheme),
+            );
+          }
         }
       }
       break;
@@ -885,6 +1073,26 @@ function updateFlowLine(state) {
       const jumpYVel = Math.max(0.001, numberOr(c.jumpYVel, 0.072));
       for (const p of computeJumpArc(start, end, jumpYVel).points) {
         points.push(p);
+      }
+    } else if (
+      c.type === "JumpTrain" &&
+      Array.isArray(c.nodes) &&
+      c.nodes.length >= 2
+    ) {
+      for (let i = 0; i < c.nodes.length - 1; i++) {
+        const n0 = c.nodes[i];
+        const n1 = c.nodes[i + 1];
+        const jumpYVel = Math.max(
+          0.001,
+          numberOr(c.arcParams?.[i]?.jumpYVel, 0.072),
+        );
+        for (const p of computeJumpArc(
+          { x: n0.cx, y: n0.cy, z: n0.cz },
+          { x: n1.cx, y: n1.cy, z: n1.cz },
+          jumpYVel,
+        ).points) {
+          points.push(p);
+        }
       }
     } else {
       points.push(flowAnchor(r));

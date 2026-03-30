@@ -23,7 +23,6 @@ export const CONSTRAINT_TYPES = [
   "PlaneCheckpoint",
   "LineSegment",
   "Corridor",
-  "JumpArc",
   "TakeoffZone",
   "LandingZone",
   "AirborneSegment",
@@ -45,6 +44,30 @@ function newId() {
 function finiteOr(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+export function normalizeTrainNode(n) {
+  return {
+    cx: finiteOr(n?.cx, 0),
+    cy: finiteOr(n?.cy, 0),
+    cz: finiteOr(n?.cz, 0),
+    hitboxType: HITBOX_TYPES.includes(n?.hitboxType) ? n.hitboxType : "sphere",
+    radius: Math.max(0.01, finiteOr(n?.radius, 8)),
+    height: Math.max(0.01, finiteOr(n?.height, 6)),
+    sizeX: Math.max(0.01, finiteOr(n?.sizeX, 8)),
+    sizeY: Math.max(0.01, finiteOr(n?.sizeY, 8)),
+    sizeZ: Math.max(0.01, finiteOr(n?.sizeZ, 8)),
+  };
+}
+
+export function createDefaultTrainNode(position) {
+  return normalizeTrainNode({ cx: position?.x, cy: position?.y, cz: position?.z });
+}
+
+function normalizeTrainArcParam(a) {
+  return {
+    jumpYVel: Math.max(0.001, finiteOr(a?.jumpYVel, 0.072)),
+  };
 }
 
 function defaultConstraintFields(type, position) {
@@ -218,6 +241,16 @@ export function normalizeConstraintRecord(record) {
   c.landingSizeX = Math.max(0.01, finiteOr(c.landingSizeX, c.sizeX));
   c.landingSizeY = Math.max(0.01, finiteOr(c.landingSizeY, c.sizeY));
   c.landingSizeZ = Math.max(0.01, finiteOr(c.landingSizeZ, c.sizeZ));
+
+  if (type === "JumpArc") {
+    if (typeof c.trainGroupId !== "string" || !c.trainGroupId.trim()) {
+      delete c.trainGroupId;
+      delete c.trainIndex;
+    } else {
+      c.trainGroupId = c.trainGroupId.trim();
+      c.trainIndex = Math.max(0, Math.floor(finiteOr(c.trainIndex, 0)));
+    }
+  }
 
   return next;
 }

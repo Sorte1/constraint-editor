@@ -1,4 +1,4 @@
-import { normalizeConstraintRecord } from "./constraints.js";
+import { createDefaultConstraint, normalizeConstraintRecord } from "./constraints.js";
 
 export function exportConstraintDocument(documentState) {
   const doc = createConstraintsOnlyPayload(documentState);
@@ -56,10 +56,61 @@ export function serializeConstraintDocument(documentState) {
 }
 
 function createConstraintsOnlyPayload(documentState) {
+  const expanded = [];
+  for (const rawRecord of documentState?.constraints || []) {
+    const record = normalizeConstraintRecord(rawRecord);
+    const c = record.constraint || {};
+    if (c.type === "JumpTrain" && Array.isArray(c.nodes) && c.nodes.length >= 2) {
+      for (let i = 0; i < c.nodes.length - 1; i++) {
+        const n0 = c.nodes[i];
+        const n1 = c.nodes[i + 1];
+        const arc = createDefaultConstraint("JumpArc", {
+          x: n0.cx,
+          y: n0.cy,
+          z: n0.cz,
+        });
+        arc.enabled = record.enabled;
+        arc.label = `${record.label || "Jump Train"} ${i + 1}`;
+        arc.constraint = {
+          ...arc.constraint,
+          takeoffCx: n0.cx,
+          takeoffCy: n0.cy,
+          takeoffCz: n0.cz,
+          takeoffHitboxType: n0.hitboxType,
+          takeoffRadius: n0.radius,
+          takeoffHeight: n0.height,
+          takeoffSizeX: n0.sizeX,
+          takeoffSizeY: n0.sizeY,
+          takeoffSizeZ: n0.sizeZ,
+          landingCx: n1.cx,
+          landingCy: n1.cy,
+          landingCz: n1.cz,
+          landingHitboxType: n1.hitboxType,
+          landingRadius: n1.radius,
+          landingHeight: n1.height,
+          landingSizeX: n1.sizeX,
+          landingSizeY: n1.sizeY,
+          landingSizeZ: n1.sizeZ,
+          jumpYVel: Number(c.arcParams?.[i]?.jumpYVel ?? 0.072),
+        };
+        expanded.push(normalizeConstraintRecord(arc));
+      }
+      continue;
+    }
+    if (c.type === "JumpArc") {
+      const stripped = normalizeConstraintRecord({
+        ...record,
+        constraint: { ...c },
+      });
+      delete stripped.constraint.trainGroupId;
+      delete stripped.constraint.trainIndex;
+      expanded.push(stripped);
+      continue;
+    }
+    expanded.push(record);
+  }
   return {
     version: 1,
-    constraints: (documentState?.constraints || []).map((record) =>
-      normalizeConstraintRecord(record),
-    ),
+    constraints: expanded,
   };
 }

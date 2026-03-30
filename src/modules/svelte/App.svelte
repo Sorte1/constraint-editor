@@ -82,6 +82,14 @@
     let autoImportedMapRef = null;
     let autoImportRetryTimer = null;
 
+    function isTrainArcRecord(record) {
+        return (
+            record?.constraint?.type === "JumpArc" &&
+            typeof record?.constraint?.trainGroupId === "string" &&
+            record.constraint.trainGroupId.length > 0
+        );
+    }
+
     const TYPE_COLORS = {
         HardCheckpoint: "#58a6ff",
         SoftCheckpoint: "#79c0ff",
@@ -89,6 +97,7 @@
         LineSegment: "#3fb950",
         Corridor: "#26a641",
         JumpArc: "#f0883e",
+        JumpTrain: "#ff9933",
         TakeoffZone: "#ffa657",
         LandingZone: "#ffb77c",
         AirborneSegment: "#d2a8ff",
@@ -107,6 +116,7 @@
         LineSegment: "╱",
         Corridor: "⟺",
         JumpArc: "⌒",
+        JumpTrain: "⛓",
         TakeoffZone: "⬆",
         LandingZone: "⬇",
         AirborneSegment: "〜",
@@ -121,11 +131,19 @@
     $: selected =
         state.constraints.find((r) => r.id === state.selectedConstraintId) ||
         null;
+    $: selectedTrainGroupId = isTrainArcRecord(selected)
+        ? selected.constraint.trainGroupId
+        : (state.trainPlacementGroupId || null);
+    $: selectedTrainGroup = selectedTrainGroupId
+        ? store.getTrainGroupView(selectedTrainGroupId)
+        : null;
+    $: trainEditorTargetId = selectedTrainGroupId || selected?.id || null;
     $: currentMapRef = state.editorIntegration.mapRef || "unknown-map";
     $: if (state.ui.activeTab === "list")
         store.setUiState({ activeTab: "edit" });
-    $: selectedType =
-        editType || selected?.constraint?.type || "HardCheckpoint";
+    $: selectedType = selectedTrainGroup || selected?.constraint?.type === "JumpTrain"
+        ? "JumpTrain"
+        : (editType || selected?.constraint?.type || "HardCheckpoint");
     $: isSegmentType =
         selectedType === "LineSegment" ||
         selectedType === "Corridor" ||
@@ -143,6 +161,8 @@
         selectedType === "LookRange" ||
         selectedType === "VelocityDirection";
     $: usesJumpArc = selectedType === "JumpArc";
+    $: usesJumpTrain =
+        Boolean(selectedTrainGroup) || selected?.constraint?.type === "JumpTrain";
     $: showSpeedWindow = selectedType === "SpeedWindow";
     $: showTurn = selectedType === "TurnConstraint";
     $: showState = selectedType === "StateCheckpoint";
@@ -153,8 +173,17 @@
     $: if (selected?.id !== syncedId) {
         syncedId = selected?.id ?? null;
         editLabel = selected?.label ?? "";
-        editType = selected?.constraint.type ?? "HardCheckpoint";
-        editConstraint = { ...(selected?.constraint || {}) };
+        if (selectedTrainGroup) {
+            editType = "JumpTrain";
+            editConstraint = {
+                nodes: selectedTrainGroup.nodes,
+                arcParams: selectedTrainGroup.arcParams,
+                trainGroupId: selectedTrainGroup.groupId,
+            };
+        } else {
+            editType = selected?.constraint.type ?? "HardCheckpoint";
+            editConstraint = { ...(selected?.constraint || {}) };
+        }
         syncedConstraintRef = selected?.constraint || null;
     }
 
@@ -166,11 +195,105 @@
     ) {
         syncedConstraintRef = selected.constraint;
         editLabel = selected.label ?? "";
-        editType = selected.constraint.type ?? "HardCheckpoint";
-        editConstraint = { ...selected.constraint };
+        if (selectedTrainGroup) {
+            editType = "JumpTrain";
+            editConstraint = {
+                nodes: selectedTrainGroup.nodes,
+                arcParams: selectedTrainGroup.arcParams,
+                trainGroupId: selectedTrainGroup.groupId,
+            };
+        } else {
+            editType = selected.constraint.type ?? "HardCheckpoint";
+            editConstraint = { ...selected.constraint };
+        }
     }
 
-    $: constraintsFiltered = state.constraints.filter((record) => {
+    $: if (selectedTrainGroup && selected?.id === syncedId) {
+        editType = "JumpTrain";
+        editConstraint = {
+            nodes: selectedTrainGroup.nodes,
+            arcParams: selectedTrainGroup.arcParams,
+            trainGroupId: selectedTrainGroup.groupId,
+        };
+    }
+
+    $: baseConstraintsVisible = state.constraints
+        .map((record, index) => ({ ...record, _listIndex: index }))
+        .filter(
+            (record) =>
+                record?.constraint?.type !== "JumpArc" &&
+                record?.constraint?.type !== "JumpTrain",
+        );
+    $: constraintIndexById = new Map(
+        state.constraints.map((record, index) => [record.id, index]),
+    );
+    $: trainGroupsVisible = (() => {
+        const groups = new Map();
+        state.constraints.forEach((record, index) => {
+            if (!isTrainArcRecord(record)) return;
+            const groupId = record.constraint.trainGroupId;
+            const existing = groups.get(groupId) || {
+                id: groupId,
+                label: "Jump Train",
+                enabled: false,
+                arcCount: 0,
+                _listIndex: index,
+            };
+            existing.arcCount += 1;
+            existing.enabled = existing.enabled || !!record.enabled;
+            existing._listIndex = Math.min(existing._listIndex, index);
+            groups.set(groupId, existing);
+        });
+        if (
+            state.trainPlacementGroupId &&
+            !groups.has(state.trainPlacementGroupId)
+        ) {
+            groups.set(state.trainPlacementGroupId, {
+                id: state.trainPlacementGroupId,
+                label: "Jump Train (new)",
+                enabled: true,
+                arcCount: 0,
+                _listIndex: state.constraints.length + 0.5,
+            });
+        }
+        return [...groups.values()].map((group) => {
+            const view = store.getTrainGroupView(group.id);
+            return {
+                id: group.id,
+                label:
+                    group.arcCount > 0
+                        ? `Jump Train (${group.arcCount} arc${group.arcCount === 1 ? "" : "s"})`
+                        : group.label,
+                enabled: group.enabled,
+                constraint: { type: "JumpTrain" },
+                isVirtualTrainGroup: true,
+                arcIds: view?.arcIds || [],
+                _listIndex: group._listIndex,
+            };
+        });
+    })();
+    $: trainArcRows = trainGroupsVisible.flatMap((group) =>
+        (group.arcIds || []).map((arcId, idx) => ({
+            id: `${group.id}::arc::${idx}`,
+            label: `Arc ${idx + 1}`,
+            enabled: state.constraints.find((c) => c.id === arcId)?.enabled ?? true,
+            constraint: { type: "JumpArc" },
+            isVirtualTrainArc: true,
+            isVirtualTrainGroup: false,
+            groupId: group.id,
+            targetConstraintId: arcId,
+            _listIndex: (constraintIndexById.get(arcId) ?? (group._listIndex + idx)) + 0.001,
+        })),
+    );
+    $: constraintsVisible = [
+        ...baseConstraintsVisible,
+        ...trainGroupsVisible.map((group) => ({
+            ...group,
+            _listIndex: (group._listIndex ?? 0) - 0.001,
+        })),
+        ...trainArcRows,
+    ].sort((a, b) => (a._listIndex ?? 0) - (b._listIndex ?? 0));
+    $: constraintsFiltered = constraintsVisible.filter((record) => {
         const q = (state.ui.listFilter || "").toLowerCase().trim();
         if (!q) return true;
         return (
@@ -179,8 +302,11 @@
         );
     });
 
-    $: enabledCount = state.constraints.filter((r) => r.enabled).length;
-    $: disabledCount = state.constraints.length - enabledCount;
+    $: visibleCount = baseConstraintsVisible.length + trainGroupsVisible.length;
+    $: enabledCount =
+        baseConstraintsVisible.filter((r) => r.enabled).length +
+        trainGroupsVisible.filter((r) => r.enabled).length;
+    $: disabledCount = visibleCount - enabledCount;
 
     function switchTab(tab) {
         store.setUiState({ activeTab: tab });
@@ -194,7 +320,22 @@
         store.setToolMode("place");
     }
 
+    function startJumpTrainMode() {
+        store.startJumpTrain();
+        onClose?.();
+    }
+
     function beginRaycastPlacement(target = "center") {
+        if (target === "trainNode") {
+            if (!state.trainPlacementGroupId) {
+                store.startJumpTrain();
+            }
+            store.setPlacementTarget("trainNode");
+            store.setPlacementArmed(true);
+            store.setToolMode("place");
+            onClose?.();
+            return;
+        }
         if (!state.selectedConstraintId) {
             const created = store.addConstraint(newType || "HardCheckpoint");
             store.selectConstraint(created.id);
@@ -218,7 +359,7 @@
     }
 
     function commitLiveConstraint(nextLabel, nextType, nextConstraint) {
-        if (!selected) {
+        if (!selected || usesJumpTrain) {
             return;
         }
         const constraint = sanitizeConstraint({
@@ -252,7 +393,7 @@
     }
 
     function applySelected() {
-        if (!selected) return;
+        if (!selected || usesJumpTrain) return;
         const constraint = sanitizeConstraint({
             ...editConstraint,
             type: editType,
@@ -431,10 +572,11 @@
         event.preventDefault();
         dragOverId = id;
     }
-    function onDropOnItem(event, targetId) {
+    function onDropOnItem(event, targetRecord) {
         event.preventDefault();
         const id = draggingId || event.dataTransfer.getData("text/plain");
-        if (!id || id === targetId) {
+        const targetId = targetRecord?.targetConstraintId || targetRecord?.id;
+        if (!id || !targetId || id === targetId) {
             draggingId = dragOverId = null;
             return;
         }
@@ -456,6 +598,20 @@
         }
         store.moveConstraintToIndex(id, state.constraints.length - 1);
         draggingId = dragOverId = null;
+    }
+
+    function selectListItem(record) {
+        if (record?.isVirtualTrainGroup) {
+            const group = store.getTrainGroupView(record.id);
+            const firstArcId = group?.arcIds?.[0] || null;
+            store.selectConstraint(firstArcId);
+            return;
+        }
+        if (record?.isVirtualTrainArc && record?.targetConstraintId) {
+            store.selectConstraint(record.targetConstraintId);
+            return;
+        }
+        store.selectConstraint(record.id);
     }
 
     function typeColor(type) {
@@ -508,6 +664,18 @@
                 </button>
             </div>
             <button
+                class="btn btn-train"
+                class:armed={!!state.trainPlacementGroupId}
+                on:click={startJumpTrainMode}
+                title="Start Jump Train — click nodes on map (Enter/Esc to finish)"
+            >
+                {#if state.trainPlacementGroupId}
+                    <span class="pulse-dot"></span> Building train… Enter/Esc to finish
+                {:else}
+                    ⛓ New Jump Train
+                {/if}
+            </button>
+            <button
                 class="btn btn-raycast"
                 class:armed={state.placementArmed}
                 on:click={beginRaycastPlacement}
@@ -529,7 +697,7 @@
         </div>
 
         <div class="stats-bar">
-            <span class="stat">{state.constraints.length} total</span>
+            <span class="stat">{visibleCount} total</span>
             <span class="stat stat-on">{enabledCount} on</span>
             {#if disabledCount > 0}<span class="stat stat-off"
                     >{disabledCount} off</span
@@ -539,20 +707,30 @@
         <div class="clist">
             {#each constraintsFiltered as record, index (record.id)}
                 <button
-                    draggable="true"
+                    draggable={!record.isVirtualTrainGroup && !record.isVirtualTrainArc}
                     class="citem"
-                    class:selected={record.id === state.selectedConstraintId}
+                    class:train-child={record.isVirtualTrainArc}
+                    class:selected={record.isVirtualTrainGroup
+                        ? selectedTrainGroupId === record.id
+                        : record.isVirtualTrainArc
+                        ? record.targetConstraintId === state.selectedConstraintId
+                        : record.id === state.selectedConstraintId}
                     class:disabled={!record.enabled}
                     class:dragover={dragOverId === record.id}
                     style="--tc: {typeColor(record.constraint.type)}"
-                    on:dragstart={(e) => onDragStart(e, record.id)}
-                    on:dragover={(e) => onDragOver(e, record.id)}
-                    on:drop={(e) => onDropOnItem(e, record.id)}
+                    on:dragstart={(e) =>
+                        !record.isVirtualTrainGroup &&
+                        !record.isVirtualTrainArc &&
+                        onDragStart(e, record.id)}
+                    on:dragover={(e) =>
+                        !record.isVirtualTrainGroup && onDragOver(e, record.id)}
+                    on:drop={(e) =>
+                        !record.isVirtualTrainGroup && onDropOnItem(e, record)}
                     on:dragend={() => {
                         draggingId = null;
                         dragOverId = null;
                     }}
-                    on:click={() => store.selectConstraint(record.id)}
+                    on:click={() => selectListItem(record)}
                 >
                     <span class="citem-accent"></span>
                     <span class="citem-num">{index + 1}</span>
@@ -569,15 +747,23 @@
                     </span>
                     {#if !record.enabled}
                         <span class="citem-badge off">OFF</span>
-                    {:else if record.id === state.selectedConstraintId}
+                    {:else if record.isVirtualTrainGroup
+                        ? selectedTrainGroupId === record.id
+                        : record.isVirtualTrainArc
+                        ? record.targetConstraintId === state.selectedConstraintId
+                        : record.id === state.selectedConstraintId}
                         <span class="citem-badge sel">SEL</span>
                     {/if}
-                    <span class="citem-handle" title="Drag to reorder">⠿</span>
+                    <span class="citem-handle" title="Drag to reorder"
+                        >{record.isVirtualTrainGroup || record.isVirtualTrainArc
+                            ? ""
+                            : "⠿"}</span
+                    >
                 </button>
             {/each}
             {#if constraintsFiltered.length === 0}
                 <div class="clist-empty">
-                    {state.constraints.length === 0
+                    {visibleCount === 0
                         ? "No constraints yet. Add one above."
                         : "No matches."}
                 </div>
@@ -624,13 +810,13 @@
                     <div class="pane">
                         <div
                             class="constraint-titlebar"
-                            style="--tc: {typeColor(selected.constraint.type)}"
+                            style="--tc: {typeColor(selectedType)}"
                         >
                             <span class="ct-icon"
-                                >{typeIcon(selected.constraint.type)}</span
+                                >{typeIcon(selectedType)}</span
                             >
                             <span class="ct-type"
-                                >{selected.constraint.type}</span
+                                >{selectedType}</span
                             >
                             <span class="ct-spacer"></span>
                             <button
@@ -668,22 +854,25 @@
                             </div>
                         </div>
 
-                        <div class="field-group">
-                            <div class="field-label">Type</div>
-                            <select
-                                class="input"
-                                value={editType}
-                                on:change={(e) =>
-                                    updateEditType(e.currentTarget.value)}
-                            >
-                                {#each CONSTRAINT_TYPES as type}
-                                    <option value={type}
-                                        >{typeIcon(type)} {type}</option
-                                    >
-                                {/each}
-                            </select>
-                        </div>
+                        {#if !usesJumpTrain && selectedType !== "JumpArc"}
+                            <div class="field-group">
+                                <div class="field-label">Type</div>
+                                <select
+                                    class="input"
+                                    value={editType}
+                                    on:change={(e) =>
+                                        updateEditType(e.currentTarget.value)}
+                                >
+                                    {#each CONSTRAINT_TYPES as type}
+                                        <option value={type}
+                                            >{typeIcon(type)} {type}</option
+                                        >
+                                    {/each}
+                                </select>
+                            </div>
+                        {/if}
 
+                        {#if !usesJumpTrain}
                         <div class="field-group">
                             <div class="field-row-header">
                                 <div class="field-label">Position</div>
@@ -741,6 +930,7 @@
                                 </div>
                             </div>
                         </div>
+                        {/if}
 
                         {#if usesDirection}
                             <div class="field-group">
@@ -1647,6 +1837,179 @@
                             </div>
                         {/if}
 
+                        {#if usesJumpTrain}
+                            <div class="field-group">
+                                <div class="field-row-header">
+                                    <div class="field-label">
+                                        Jump Train — {(editConstraint.nodes?.length ?? 0)} node{(editConstraint.nodes?.length ?? 0) === 1 ? "" : "s"}, {(editConstraint.arcParams?.length ?? 0)} arc{(editConstraint.arcParams?.length ?? 0) === 1 ? "" : "s"}
+                                    </div>
+                                    <div class="field-actions">
+                                        <button
+                                            class="btn btn-xs btn-accent"
+                                            on:click={() => beginRaycastPlacement("trainNode")}
+                                        >+ Node</button>
+                                    </div>
+                                </div>
+
+                                {#if (editConstraint.nodes?.length ?? 0) === 0}
+                                    <div class="dim-note">No nodes yet. Click "+ Node" or press T and click the map.</div>
+                                {/if}
+
+                                {#each (editConstraint.nodes ?? []) as node, i}
+                                    <div class="train-node-block">
+                                        <div class="field-row-header">
+                                            <div class="field-label train-node-label">
+                                                {#if i === 0}
+                                                    ○ Node 1 — Start
+                                                {:else if i === (editConstraint.nodes.length - 1)}
+                                                    ● Node {i + 1} — End
+                                                {:else}
+                                                    ⛓ Node {i + 1} — Arc {i}→{i + 1}
+                                                {/if}
+                                            </div>
+                                            <div class="field-actions">
+                                                <button
+                                                    class="btn btn-xs btn-danger"
+                                                    on:click={() => store.removeTrainNode(trainEditorTargetId, i)}
+                                                >Del</button>
+                                            </div>
+                                        </div>
+                                        <div class="xyz-grid">
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis x">X</span>
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    value={node.cx ?? 0}
+                                                    on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { cx: Number(e.currentTarget.value) })}
+                                                />
+                                            </div>
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis y">Y</span>
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    value={node.cy ?? 0}
+                                                    on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { cy: Number(e.currentTarget.value) })}
+                                                />
+                                            </div>
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis z">Z</span>
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    value={node.cz ?? 0}
+                                                    on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { cz: Number(e.currentTarget.value) })}
+                                                />
+                                            </div>
+                                        </div>
+                                        <div class="row gap-8">
+                                            <select
+                                                class="input"
+                                                value={node.hitboxType || "sphere"}
+                                                on:change={(e) => store.updateTrainNode(trainEditorTargetId, i, { hitboxType: e.currentTarget.value })}
+                                            >
+                                                {#each HITBOX_TYPES as shape}
+                                                    <option value={shape}>{shape}</option>
+                                                {/each}
+                                            </select>
+                                        </div>
+                                        {#if (node.hitboxType || "sphere") === "sphere" || (node.hitboxType || "sphere") === "circle"}
+                                            <div class="row gap-8 align-center">
+                                                <input
+                                                    class="input mono grow"
+                                                    type="number"
+                                                    step="any"
+                                                    min="0"
+                                                    value={node.radius ?? 8}
+                                                    on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { radius: Number(e.currentTarget.value) })}
+                                                />
+                                                <span class="dim-note">radius</span>
+                                            </div>
+                                        {:else if (node.hitboxType || "sphere") === "cylinder"}
+                                            <div class="xyz-grid">
+                                                <div class="xyz-field">
+                                                    <span class="xyz-axis z">Radius</span>
+                                                    <input
+                                                        class="input mono"
+                                                        type="number"
+                                                        step="any"
+                                                        min="0"
+                                                        value={node.radius ?? 8}
+                                                        on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { radius: Number(e.currentTarget.value) })}
+                                                    />
+                                                </div>
+                                                <div class="xyz-field">
+                                                    <span class="xyz-axis y">Height</span>
+                                                    <input
+                                                        class="input mono"
+                                                        type="number"
+                                                        step="any"
+                                                        min="0"
+                                                        value={node.height ?? 6}
+                                                        on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { height: Number(e.currentTarget.value) })}
+                                                    />
+                                                </div>
+                                            </div>
+                                        {:else}
+                                            <div class="xyz-grid">
+                                                <div class="xyz-field">
+                                                    <span class="xyz-axis x">W</span>
+                                                    <input
+                                                        class="input mono"
+                                                        type="number"
+                                                        step="any"
+                                                        min="0"
+                                                        value={node.sizeX ?? 8}
+                                                        on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { sizeX: Number(e.currentTarget.value) })}
+                                                    />
+                                                </div>
+                                                <div class="xyz-field">
+                                                    <span class="xyz-axis y">H</span>
+                                                    <input
+                                                        class="input mono"
+                                                        type="number"
+                                                        step="any"
+                                                        min="0"
+                                                        value={node.sizeY ?? 8}
+                                                        on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { sizeY: Number(e.currentTarget.value) })}
+                                                    />
+                                                </div>
+                                                <div class="xyz-field">
+                                                    <span class="xyz-axis z">D</span>
+                                                    <input
+                                                        class="input mono"
+                                                        type="number"
+                                                        step="any"
+                                                        min="0"
+                                                        value={node.sizeZ ?? 8}
+                                                        on:input={(e) => store.updateTrainNode(trainEditorTargetId, i, { sizeZ: Number(e.currentTarget.value) })}
+                                                    />
+                                                </div>
+                                            </div>
+                                        {/if}
+                                    </div>
+
+                                    {#if i < (editConstraint.arcParams?.length ?? 0)}
+                                        <div class="train-arc-params">
+                                            <span class="train-arc-label">Arc {i + 1} jump y-vel</span>
+                                            <input
+                                                class="input mono"
+                                                type="number"
+                                                step="any"
+                                                min="0.001"
+                                                value={editConstraint.arcParams[i]?.jumpYVel ?? 0.072}
+                                                on:input={(e) => store.updateTrainArcParams(trainEditorTargetId, i, { jumpYVel: Number(e.currentTarget.value) })}
+                                            />
+                                        </div>
+                                    {/if}
+                                {/each}
+                            </div>
+                        {/if}
+
                         {#if showLookDirection}
                             <div class="field-group">
                                 <div class="field-label">Look Direction</div>
@@ -2458,6 +2821,12 @@
         border-color: var(--yellow);
         box-shadow: 0 0 0 1px var(--yellow) inset;
     }
+    .citem.train-child {
+        margin-left: 18px;
+        width: calc(100% - 18px);
+        background: rgba(240, 136, 62, 0.06);
+        border-style: dashed;
+    }
 
     /* Left accent stripe */
     .citem-accent {
@@ -3155,6 +3524,54 @@
         border-color: #6e3d00;
         color: var(--yellow);
         animation: armed-pulse 1.5s ease-in-out infinite;
+    }
+    .btn-train {
+        background: var(--bg2);
+        border-color: var(--border);
+        font-size: 12px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        justify-content: center;
+        color: #ff9933;
+    }
+    .btn-train.armed {
+        background: #261500;
+        border-color: #7a4400;
+        color: #ffbb55;
+        animation: armed-pulse 1.5s ease-in-out infinite;
+    }
+    .train-node-block {
+        margin: 6px 0;
+        padding: 8px;
+        background: rgba(255, 153, 51, 0.07);
+        border: 1px solid rgba(255, 153, 51, 0.2);
+        border-radius: 5px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .train-node-label {
+        font-size: 11px;
+        color: #ff9933;
+        font-weight: 600;
+    }
+    .train-arc-params {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        background: rgba(255, 153, 51, 0.04);
+        border-left: 2px solid rgba(255, 153, 51, 0.3);
+        border-radius: 0 4px 4px 0;
+        margin: 2px 0 4px 0;
+    }
+    .train-arc-label {
+        font-size: 10px;
+        color: #8b949e;
+        white-space: nowrap;
+        flex-shrink: 0;
     }
     @keyframes armed-pulse {
         0%,

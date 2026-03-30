@@ -133,14 +133,26 @@ export function mountUi(store, hooks) {
       if (id) {
         store.deleteConstraint(id);
       }
+    } else if (k === "t") {
+      store.startJumpTrain();
+      setOpen(false);
     } else if (event.key === "Escape") {
-      if (store.getState().placementArmed) {
+      if (store.getState().trainPlacementGroupId) {
+        store.finishJumpTrain();
+        setOpen(true);
+      } else if (store.getState().placementArmed) {
         store.setPlacementArmed(false);
         store.setPlacementTarget("center");
         store.setToolMode("select");
       } else {
         setOpen(false);
       }
+    } else if (
+      event.key === "Enter" &&
+      store.getState().trainPlacementGroupId
+    ) {
+      store.finishJumpTrain();
+      setOpen(true);
     } else if (k === "d" && event.ctrlKey) {
       const id = store.getState().selectedConstraintId;
       if (id) {
@@ -156,6 +168,19 @@ export function mountUi(store, hooks) {
 
   const unsubscribePick = hooks.subscribePick((hit, event) => {
     const state = store.getState();
+    if (
+      state.placementArmed &&
+      state.placementTarget === "trainNode" &&
+      state.trainPlacementGroupId
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === "function") {
+        event.stopImmediatePropagation();
+      }
+      store.addTrainNode(hit.point);
+      return true;
+    }
     if (!state.placementArmed || !state.selectedConstraintId) {
       return;
     }
@@ -189,7 +214,10 @@ export function mountUi(store, hooks) {
       patch.takeoffSizeX = size.sizeX;
       patch.takeoffSizeY = size.sizeY;
       patch.takeoffSizeZ = size.sizeZ;
-    } else if (selected.constraint.type === "JumpArc" && target === "landingSize") {
+    } else if (
+      selected.constraint.type === "JumpArc" &&
+      target === "landingSize"
+    ) {
       const size = calcBoxSizeFromCenter(
         {
           x: selected.constraint.landingCx,
@@ -220,9 +248,18 @@ export function mountUi(store, hooks) {
       }
     } else if (target === "segmentSize") {
       const mid = {
-        x: (Number(selected.constraint.ax ?? 0) + Number(selected.constraint.bx ?? 0)) * 0.5,
-        y: (Number(selected.constraint.ay ?? 0) + Number(selected.constraint.by ?? 0)) * 0.5,
-        z: (Number(selected.constraint.az ?? 0) + Number(selected.constraint.bz ?? 0)) * 0.5,
+        x:
+          (Number(selected.constraint.ax ?? 0) +
+            Number(selected.constraint.bx ?? 0)) *
+          0.5,
+        y:
+          (Number(selected.constraint.ay ?? 0) +
+            Number(selected.constraint.by ?? 0)) *
+          0.5,
+        z:
+          (Number(selected.constraint.az ?? 0) +
+            Number(selected.constraint.bz ?? 0)) *
+          0.5,
       };
       const size = calcBoxSizeFromCenter(mid, hit.point);
       patch.sizeX = size.sizeX;
