@@ -29,6 +29,7 @@ export const CONSTRAINT_TYPES = [
   "LookDirection",
   "LookRange",
   "SpeedWindow",
+  "SpeedLockedBox",
   "VelocityDirection",
   "TurnConstraint",
   "StateCheckpoint",
@@ -61,7 +62,11 @@ export function normalizeTrainNode(n) {
 }
 
 export function createDefaultTrainNode(position) {
-  return normalizeTrainNode({ cx: position?.x, cy: position?.y, cz: position?.z });
+  return normalizeTrainNode({
+    cx: position?.x,
+    cy: position?.y,
+    cz: position?.z,
+  });
 }
 
 function normalizeTrainArcParam(a) {
@@ -111,6 +116,7 @@ function defaultConstraintFields(type, position) {
     yawMax: 0.6,
     minSpeed: 0,
     maxSpeed: 0.02,
+    unlockSpeed: 0.02,
     targetYaw: 0,
     maxDeltaRad: 0.5,
     requiredState: "Grounded",
@@ -143,6 +149,8 @@ function defaultConstraintFields(type, position) {
     type === "AirborneSegment"
   ) {
     base.hitboxType = "cylinder";
+  } else if (type === "SpeedLockedBox") {
+    base.hitboxType = "box";
   }
 
   return base;
@@ -200,7 +208,9 @@ export function normalizeConstraintRecord(record) {
   c.by = finiteOr(c.by, fallbackBy);
   c.bz = finiteOr(c.bz, fallbackBz);
 
-  c.hitboxType = HITBOX_TYPES.includes(c.hitboxType) ? c.hitboxType : base.constraint.hitboxType;
+  c.hitboxType = HITBOX_TYPES.includes(c.hitboxType)
+    ? c.hitboxType
+    : base.constraint.hitboxType;
   c.height = Math.max(0.01, finiteOr(c.height, 6));
   c.sizeX = Math.max(0.01, finiteOr(c.sizeX, 8));
   c.sizeY = Math.max(0.01, finiteOr(c.sizeY, 8));
@@ -212,9 +222,15 @@ export function normalizeConstraintRecord(record) {
   c.yawMax = finiteOr(c.yawMax, 0.6);
   c.minSpeed = Math.max(0, finiteOr(c.minSpeed, 0));
   c.maxSpeed = Math.max(c.minSpeed, finiteOr(c.maxSpeed, 0.02));
+  c.unlockSpeed = Math.max(0, finiteOr(c.unlockSpeed, 0.02));
   c.targetYaw = finiteOr(c.targetYaw, 0);
   c.maxDeltaRad = Math.max(0, finiteOr(c.maxDeltaRad, 0.5));
-  c.requiredState = REQUIRED_STATES.includes(c.requiredState) ? c.requiredState : "Grounded";
+  c.requiredState = REQUIRED_STATES.includes(c.requiredState)
+    ? c.requiredState
+    : "Grounded";
+  if (type === "SpeedLockedBox") {
+    c.hitboxType = "box";
+  }
 
   c.jumpYVel = Math.max(0.001, finiteOr(c.jumpYVel, 0.072));
 
@@ -287,6 +303,7 @@ export function validateConstraint(record) {
     "yawMax",
     "minSpeed",
     "maxSpeed",
+    "unlockSpeed",
     "targetYaw",
     "maxDeltaRad",
     "jumpYVel",
@@ -308,7 +325,10 @@ export function validateConstraint(record) {
     "landingSizeZ",
   ];
   for (const key of numericKeys) {
-    if (key in (record?.constraint || {}) && !Number.isFinite(record.constraint[key])) {
+    if (
+      key in (record?.constraint || {}) &&
+      !Number.isFinite(record.constraint[key])
+    ) {
       errors.push(`${key} must be finite`);
     }
   }

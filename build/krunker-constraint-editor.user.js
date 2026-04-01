@@ -15847,6 +15847,7 @@
     "LookDirection",
     "LookRange",
     "SpeedWindow",
+    "SpeedLockedBox",
     "VelocityDirection",
     "TurnConstraint",
     "StateCheckpoint"
@@ -15917,6 +15918,7 @@
       yawMax: 0.6,
       minSpeed: 0,
       maxSpeed: 0.02,
+      unlockSpeed: 0.02,
       targetYaw: 0,
       maxDeltaRad: 0.5,
       requiredState: "Grounded",
@@ -15944,6 +15946,8 @@
       base.hitboxType = "circle";
     } else if (type === "LineSegment" || type === "Corridor" || type === "AirborneSegment") {
       base.hitboxType = "cylinder";
+    } else if (type === "SpeedLockedBox") {
+      base.hitboxType = "box";
     }
     return base;
   }
@@ -16001,9 +16005,13 @@
     c.yawMax = finiteOr(c.yawMax, 0.6);
     c.minSpeed = Math.max(0, finiteOr(c.minSpeed, 0));
     c.maxSpeed = Math.max(c.minSpeed, finiteOr(c.maxSpeed, 0.02));
+    c.unlockSpeed = Math.max(0, finiteOr(c.unlockSpeed, 0.02));
     c.targetYaw = finiteOr(c.targetYaw, 0);
     c.maxDeltaRad = Math.max(0, finiteOr(c.maxDeltaRad, 0.5));
     c.requiredState = REQUIRED_STATES.includes(c.requiredState) ? c.requiredState : "Grounded";
+    if (type === "SpeedLockedBox") {
+      c.hitboxType = "box";
+    }
     c.jumpYVel = Math.max(1e-3, finiteOr(c.jumpYVel, 0.072));
     c.takeoffCx = finiteOr(c.takeoffCx, c.cx);
     c.takeoffCy = finiteOr(c.takeoffCy, c.cy);
@@ -16211,7 +16219,9 @@
       const groupId = resolveTrainGroupId(records, idOrGroup);
       if (!groupId) return [];
       const order = new Map(records.map((r, i) => [r.id, i]));
-      return records.filter((r) => isGroupedJumpArc(r) && r.constraint.trainGroupId === groupId).sort(
+      return records.filter(
+        (r) => isGroupedJumpArc(r) && r.constraint.trainGroupId === groupId
+      ).sort(
         (a, b) => Number(a.constraint.trainIndex ?? 0) - Number(b.constraint.trainIndex ?? 0) || Number(order.get(a.id) ?? 0) - Number(order.get(b.id) ?? 0)
       );
     }
@@ -16222,13 +16232,22 @@
       if ("cx" in patch) nextConstraint[`${prefix}Cx`] = Number(patch.cx);
       if ("cy" in patch) nextConstraint[`${prefix}Cy`] = Number(patch.cy);
       if ("cz" in patch) nextConstraint[`${prefix}Cz`] = Number(patch.cz);
-      if ("hitboxType" in patch) nextConstraint[`${prefix}HitboxType`] = patch.hitboxType;
-      if ("radius" in patch) nextConstraint[`${prefix}Radius`] = Number(patch.radius);
-      if ("height" in patch) nextConstraint[`${prefix}Height`] = Number(patch.height);
-      if ("sizeX" in patch) nextConstraint[`${prefix}SizeX`] = Number(patch.sizeX);
-      if ("sizeY" in patch) nextConstraint[`${prefix}SizeY`] = Number(patch.sizeY);
-      if ("sizeZ" in patch) nextConstraint[`${prefix}SizeZ`] = Number(patch.sizeZ);
-      return normalizeConstraintRecord({ ...arcRecord, constraint: nextConstraint });
+      if ("hitboxType" in patch)
+        nextConstraint[`${prefix}HitboxType`] = patch.hitboxType;
+      if ("radius" in patch)
+        nextConstraint[`${prefix}Radius`] = Number(patch.radius);
+      if ("height" in patch)
+        nextConstraint[`${prefix}Height`] = Number(patch.height);
+      if ("sizeX" in patch)
+        nextConstraint[`${prefix}SizeX`] = Number(patch.sizeX);
+      if ("sizeY" in patch)
+        nextConstraint[`${prefix}SizeY`] = Number(patch.sizeY);
+      if ("sizeZ" in patch)
+        nextConstraint[`${prefix}SizeZ`] = Number(patch.sizeZ);
+      return normalizeConstraintRecord({
+        ...arcRecord,
+        constraint: nextConstraint
+      });
     }
     function trainNodeFromArcSide(arcRecord, side) {
       const c = arcRecord.constraint || {};
@@ -16424,17 +16443,61 @@
       moveConstraintToIndex(id, targetIndex) {
         setState(
           (s) => withHistory(s, () => {
-            const fromIndex = s.constraints.findIndex((record) => record.id === id);
+            const fromIndex = s.constraints.findIndex(
+              (record) => record.id === id
+            );
             if (fromIndex < 0) {
               return s;
             }
-            const clampedTarget = Math.max(0, Math.min(s.constraints.length - 1, targetIndex));
+            const clampedTarget = Math.max(
+              0,
+              Math.min(s.constraints.length - 1, targetIndex)
+            );
             if (fromIndex === clampedTarget) {
               return s;
             }
             const next2 = [...s.constraints];
             const [moved] = next2.splice(fromIndex, 1);
             next2.splice(clampedTarget, 0, moved);
+            return { ...s, constraints: next2 };
+          })
+        );
+      },
+      moveTrainGroupToIndex(idOrGroup, targetIndex) {
+        setState(
+          (s) => withHistory(s, () => {
+            const groupId = resolveTrainGroupId(s.constraints, idOrGroup);
+            if (!groupId) return s;
+            const indices = [];
+            for (let i = 0; i < s.constraints.length; i++) {
+              const record = s.constraints[i];
+              if (isGroupedJumpArc(record) && record.constraint.trainGroupId === groupId) {
+                indices.push(i);
+              }
+            }
+            if (!indices.length) return s;
+            const first = indices[0];
+            const last = indices[indices.length - 1];
+            const rawTarget = Math.max(
+              0,
+              Math.min(
+                s.constraints.length,
+                Math.floor(Number.isFinite(Number(targetIndex)) ? Number(targetIndex) : 0)
+              )
+            );
+            if (rawTarget >= first && rawTarget <= last + 1) {
+              return s;
+            }
+            const removeSet = new Set(indices);
+            const block2 = s.constraints.filter((_, idx) => removeSet.has(idx));
+            const remaining = s.constraints.filter((_, idx) => !removeSet.has(idx));
+            const removedBeforeTarget = indices.filter((idx) => idx < rawTarget).length;
+            const insertAt = Math.max(
+              0,
+              Math.min(remaining.length, rawTarget - removedBeforeTarget)
+            );
+            const next2 = [...remaining];
+            next2.splice(insertAt, 0, ...block2);
             return { ...s, constraints: next2 };
           })
         );
@@ -16455,7 +16518,10 @@
         setState((s) => ({ ...s, viewportCursor }));
       },
       setEditorIntegration(patch) {
-        setState((s) => ({ ...s, editorIntegration: { ...s.editorIntegration, ...patch } }));
+        setState((s) => ({
+          ...s,
+          editorIntegration: { ...s.editorIntegration, ...patch }
+        }));
       },
       setVisuals(patch) {
         setState(
@@ -16667,7 +16733,9 @@
             });
             return {
               ...s,
-              constraints: s.constraints.map((r) => r.id === target.id ? updated : r)
+              constraints: s.constraints.map(
+                (r) => r.id === target.id ? updated : r
+              )
             };
           })
         );
@@ -16710,8 +16778,13 @@
             }
             let nextConstraints = s.constraints.filter((r) => !removeIds.has(r.id)).map((r) => byId.get(r.id) || r);
             const groupId = arcs[0].constraint.trainGroupId;
-            nextConstraints = normalizeTrainGroupIndices(nextConstraints, groupId);
-            const selectedStillExists = nextConstraints.some((r) => r.id === s.selectedConstraintId);
+            nextConstraints = normalizeTrainGroupIndices(
+              nextConstraints,
+              groupId
+            );
+            const selectedStillExists = nextConstraints.some(
+              (r) => r.id === s.selectedConstraintId
+            );
             return {
               ...s,
               constraints: nextConstraints,
@@ -16723,7 +16796,11 @@
       getTrainGroupView(idOrGroup) {
         const groupId = resolveTrainGroupId(state2.constraints, idOrGroup) || idOrGroup;
         const pending2 = groupId && state2.trainPlacementGroupId === groupId ? state2.trainPendingNode : null;
-        return getTrainGroupViewFromConstraints(state2.constraints, idOrGroup, pending2);
+        return getTrainGroupViewFromConstraints(
+          state2.constraints,
+          idOrGroup,
+          pending2
+        );
       }
     };
     return actions;
@@ -23068,58 +23145,61 @@ ${component_stack}
   var root_14 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Type</div> <select class="input svelte-1nhql4u"></select></div>`);
   var root_16 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Position</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2196 Raycast Pick</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
   var root_17 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Direction Normal</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
-  var root_19 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_20 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_21 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_22 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_18 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Hitbox</div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`);
-  var root_24 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_26 = from_html(`<div class="dim-note svelte-1nhql4u">Airborne box uses start/end as opposite corners.</div>`);
-  var root_27 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_28 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">thickness radius</span></div>`);
-  var root_23 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment Start</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Start</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment End</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick End</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
-  var root_29 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Jump Physics</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0.001"/> <span class="dim-note svelte-1nhql4u">jump y-vel</span></div></div>`);
-  var root_31 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_32 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_33 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_34 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_35 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Click to lock in`, 1);
-  var root_37 = from_html(`<button class="btn btn-xs btn-danger svelte-1nhql4u">Clear</button>`);
-  var root_38 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div></div>`);
-  var root_39 = from_html(`<div class="dim-note svelte-1nhql4u">No sample \u2014 arc starts from takeoff zone center.</div>`);
-  var root_40 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_41 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_42 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_43 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
-  var root_30 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Takeoff</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Takeoff</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Takeoff Sample</div> <div class="field-actions svelte-1nhql4u"><button><!></button> <!></div></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Landing</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Landing</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
-  var root_45 = from_html(`<div class="dim-note svelte-1nhql4u">No nodes yet. Click "+ Node" or press T and click the map.</div>`);
-  var root_50 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_51 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
-  var root_52 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_53 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">W</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">H</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">D</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
-  var root_54 = from_html(`<div class="train-arc-params svelte-1nhql4u"><span class="train-arc-label svelte-1nhql4u"></span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0.001"/></div>`);
-  var root_46 = from_html(`<div class="train-node-block svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label train-node-label svelte-1nhql4u"><!></div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-danger svelte-1nhql4u">Del</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <!>`, 1);
-  var root_44 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">+ Node</button></div></div> <!> <!></div>`);
-  var root_55 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
-  var root_56 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Range</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Yaw Min</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Yaw Max</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
-  var root_57 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Velocity Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Target Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
-  var root_58 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Speed Window</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Max Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
-  var root_59 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Turn Constraint</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">max delta rad</span></div></div>`);
-  var root_61 = from_html(`<option class="svelte-1nhql4u"> </option>`);
-  var root_60 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Required State</div> <select class="input svelte-1nhql4u"></select></div>`);
-  var root_62 = from_html(`<div class="cursor-info svelte-1nhql4u"><span class="cursor-label svelte-1nhql4u">Cursor hit</span> <span class="cursor-coords mono svelte-1nhql4u"> </span></div>`);
-  var root_64 = from_html(`<span class="readout-item svelte-1nhql4u">bx <b class="svelte-1nhql4u"> </b></span>`);
-  var root_63 = from_html(`<div class="readout svelte-1nhql4u"><span class="readout-item svelte-1nhql4u">cx <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cy <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cz <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">r <b class="svelte-1nhql4u"> </b></span> <!></div>`);
-  var root_13 = from_html(`<div class="pane svelte-1nhql4u"><div class="constraint-titlebar svelte-1nhql4u"><span class="ct-icon svelte-1nhql4u"> </span> <span class="ct-type svelte-1nhql4u"> </span> <span class="ct-spacer svelte-1nhql4u"></span> <button> </button> <button class="btn btn-sm svelte-1nhql4u" title="Duplicate (Ctrl+D)">\u29C9 Dupe</button> <button class="btn btn-danger btn-sm svelte-1nhql4u" title="Delete (Del)">\u2715 Del</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Label</div> <div class="row gap-8 svelte-1nhql4u"><input class="input grow svelte-1nhql4u" placeholder="Constraint label"/></div></div> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <button class="btn btn-apply svelte-1nhql4u">\u2713 Apply Changes</button> <!> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Nudge (1 unit)</div> <div class="nudge-grid svelte-1nhql4u"><button class="btn btn-nudge x svelte-1nhql4u">\u2212X</button> <button class="btn btn-nudge x svelte-1nhql4u">+X</button> <button class="btn btn-nudge y svelte-1nhql4u">\u2212Y</button> <button class="btn btn-nudge y svelte-1nhql4u">+Y</button> <button class="btn btn-nudge z svelte-1nhql4u">\u2212Z</button> <button class="btn btn-nudge z svelte-1nhql4u">+Z</button></div></div> <!></div>`);
-  var root_65 = from_html(`<div class="empty-state svelte-1nhql4u"><div class="empty-icon svelte-1nhql4u">\u2B21</div> <div class="empty-msg svelte-1nhql4u">Select a constraint from the list</div> <div class="empty-sub svelte-1nhql4u">or press <kbd class="svelte-1nhql4u">A</kbd> to add one</div></div>`);
-  var root_67 = from_html(`<button><span class="theme-dot svelte-1nhql4u"></span> </button>`);
-  var root_66 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Visual Controls</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Visibility</div> <div class="toggle-list svelte-1nhql4u"><label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show all constraints</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Selected only</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show flow lines</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show labels</span></label></div></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="0.1" max="1" step="0.05"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="1" max="6" step="1"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Color Theme</div> <div class="theme-grid svelte-1nhql4u"></div></div></div>`);
-  var root_69 = from_html(`<div class="field-group svelte-1nhql4u"><div class="empty-inline svelte-1nhql4u">No saved positions yet.</div></div>`);
-  var root_71 = from_html(`<div class="pos-item svelte-1nhql4u"><div class="pos-name svelte-1nhql4u"> </div> <div class="pos-coords mono svelte-1nhql4u"> </div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2197 Apply to Selected</button> <button class="btn btn-xs btn-danger svelte-1nhql4u">\u2715</button></div></div>`);
-  var root_70 = from_html(`<div class="pos-list svelte-1nhql4u"></div>`);
-  var root_68 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Saved Positions</div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm svelte-1nhql4u">\u2295 Save Cursor</button> <button class="btn btn-sm svelte-1nhql4u">\u2295 Save Selected</button></div> <!></div>`);
-  var root_73 = from_html(`<span class="dirty svelte-1nhql4u">\u25CF unsaved</span>`);
-  var root_72 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Import / Export</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Auto Map Import</div> <textarea class="json-area mono svelte-1nhql4u" rows="3" placeholder="Paste JSON map string here for window.global.importMap(...) (Enter to run, Shift+Enter for newline)\u2026"></textarea> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u21BB Run window.global.importMap(json)</button></div></div> <div class="io-actions svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u2193 Export JSON</button> <button> </button> <button class="btn btn-sm svelte-1nhql4u">\u2191 Load from Text</button> <label class="btn btn-sm btn-file svelte-1nhql4u" title="Import from .json file">\u2295 Import File <input type="file" accept="application/json,.json" class="svelte-1nhql4u"/></label> <button class="btn btn-sm btn-danger svelte-1nhql4u">\u2715 Clear All</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JSON</div> <textarea class="json-area mono svelte-1nhql4u" placeholder="Paste JSON here to load, or copy/export to populate\u2026"></textarea></div> <div class="io-meta svelte-1nhql4u"><span class="svelte-1nhql4u"> </span> <span class="svelte-1nhql4u">\xB7</span> <span class="svelte-1nhql4u"> </span> <!></div></div>`);
+  var root_19 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_21 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_22 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_23 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_24 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_20 = from_html(`<div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!>`, 1);
+  var root_18 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Hitbox</div> <!></div>`);
+  var root_26 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_28 = from_html(`<div class="dim-note svelte-1nhql4u">Airborne box uses start/end as opposite corners.</div>`);
+  var root_29 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_30 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">thickness radius</span></div>`);
+  var root_25 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment Start</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Start</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Segment End</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick End</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
+  var root_31 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Jump Physics</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0.001"/> <span class="dim-note svelte-1nhql4u">jump y-vel</span></div></div>`);
+  var root_33 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_34 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_35 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_36 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_37 = from_html(`<span class="pulse-dot svelte-1nhql4u"></span> Click to lock in`, 1);
+  var root_39 = from_html(`<button class="btn btn-xs btn-danger svelte-1nhql4u">Clear</button>`);
+  var root_40 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" readonly=""/></div></div>`);
+  var root_41 = from_html(`<div class="dim-note svelte-1nhql4u">No sample \u2014 arc starts from takeoff zone center.</div>`);
+  var root_42 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_43 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_44 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_45 = from_html(`<div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Box Size</button></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Size X</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Size Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Size Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`, 1);
+  var root_32 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Takeoff</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Takeoff</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Takeoff Sample</div> <div class="field-actions svelte-1nhql4u"><button><!></button> <!></div></div> <!></div> <div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JumpArc Landing</div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">Pick Landing</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div>`, 1);
+  var root_47 = from_html(`<div class="dim-note svelte-1nhql4u">No nodes yet. Click "+ Node" or press T and click the map.</div>`);
+  var root_52 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_53 = from_html(`<div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">radius</span></div>`);
+  var root_54 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Radius</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Height</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_55 = from_html(`<div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">W</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">H</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">D</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div>`);
+  var root_56 = from_html(`<div class="train-arc-params svelte-1nhql4u"><span class="train-arc-label svelte-1nhql4u"></span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0.001"/></div>`);
+  var root_48 = from_html(`<div class="train-node-block svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label train-node-label svelte-1nhql4u"><!></div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-danger svelte-1nhql4u">Del</button></div></div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">X</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Y</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Z</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div> <div class="row gap-8 svelte-1nhql4u"><select class="input svelte-1nhql4u"></select></div> <!></div> <!>`, 1);
+  var root_46 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-row-header svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <div class="field-actions svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">+ Node</button></div></div> <!> <!></div>`);
+  var root_57 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
+  var root_58 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Look Range</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Yaw Min</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Yaw Max</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div></div></div>`);
+  var root_59 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Velocity Direction</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Target Yaw</span> <input class="input mono svelte-1nhql4u" type="number" step="any"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis z svelte-1nhql4u">Tolerance</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
+  var root_60 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Speed Window</div> <div class="xyz-grid svelte-1nhql4u"><div class="xyz-field svelte-1nhql4u"><span class="xyz-axis x svelte-1nhql4u">Min Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div> <div class="xyz-field svelte-1nhql4u"><span class="xyz-axis y svelte-1nhql4u">Max Speed</span> <input class="input mono svelte-1nhql4u" type="number" step="any" min="0"/></div></div></div>`);
+  var root_61 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Box Lock Speed</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">min speed to leave box</span></div></div>`);
+  var root_62 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Turn Constraint</div> <div class="row gap-8 align-center svelte-1nhql4u"><input class="input mono grow svelte-1nhql4u" type="number" step="any" min="0"/> <span class="dim-note svelte-1nhql4u">max delta rad</span></div></div>`);
+  var root_64 = from_html(`<option class="svelte-1nhql4u"> </option>`);
+  var root_63 = from_html(`<div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Required State</div> <select class="input svelte-1nhql4u"></select></div>`);
+  var root_65 = from_html(`<div class="cursor-info svelte-1nhql4u"><span class="cursor-label svelte-1nhql4u">Cursor hit</span> <span class="cursor-coords mono svelte-1nhql4u"> </span></div>`);
+  var root_67 = from_html(`<span class="readout-item svelte-1nhql4u">bx <b class="svelte-1nhql4u"> </b></span>`);
+  var root_66 = from_html(`<div class="readout svelte-1nhql4u"><span class="readout-item svelte-1nhql4u">cx <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cy <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">cz <b class="svelte-1nhql4u"> </b></span> <span class="readout-item svelte-1nhql4u">r <b class="svelte-1nhql4u"> </b></span> <!></div>`);
+  var root_13 = from_html(`<div class="pane svelte-1nhql4u"><div class="constraint-titlebar svelte-1nhql4u"><span class="ct-icon svelte-1nhql4u"> </span> <span class="ct-type svelte-1nhql4u"> </span> <span class="ct-spacer svelte-1nhql4u"></span> <button> </button> <button class="btn btn-sm svelte-1nhql4u" title="Duplicate (Ctrl+D)">\u29C9 Dupe</button> <button class="btn btn-danger btn-sm svelte-1nhql4u" title="Delete (Del)">\u2715 Del</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Label</div> <div class="row gap-8 svelte-1nhql4u"><input class="input grow svelte-1nhql4u" placeholder="Constraint label"/></div></div> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <!> <button class="btn btn-apply svelte-1nhql4u">\u2713 Apply Changes</button> <!> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Nudge (1 unit)</div> <div class="nudge-grid svelte-1nhql4u"><button class="btn btn-nudge x svelte-1nhql4u">\u2212X</button> <button class="btn btn-nudge x svelte-1nhql4u">+X</button> <button class="btn btn-nudge y svelte-1nhql4u">\u2212Y</button> <button class="btn btn-nudge y svelte-1nhql4u">+Y</button> <button class="btn btn-nudge z svelte-1nhql4u">\u2212Z</button> <button class="btn btn-nudge z svelte-1nhql4u">+Z</button></div></div> <!></div>`);
+  var root_68 = from_html(`<div class="empty-state svelte-1nhql4u"><div class="empty-icon svelte-1nhql4u">\u2B21</div> <div class="empty-msg svelte-1nhql4u">Select a constraint from the list</div> <div class="empty-sub svelte-1nhql4u">or press <kbd class="svelte-1nhql4u">A</kbd> to add one</div></div>`);
+  var root_70 = from_html(`<button><span class="theme-dot svelte-1nhql4u"></span> </button>`);
+  var root_69 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Visual Controls</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Visibility</div> <div class="toggle-list svelte-1nhql4u"><label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show all constraints</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Selected only</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show flow lines</span></label> <label class="toggle-row svelte-1nhql4u"><input type="checkbox" class="svelte-1nhql4u"/> <span class="toggle-track svelte-1nhql4u"></span> <span class="svelte-1nhql4u">Show labels</span></label></div></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="0.1" max="1" step="0.05"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u"> </div> <input type="range" class="slider svelte-1nhql4u" min="1" max="6" step="1"/></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Color Theme</div> <div class="theme-grid svelte-1nhql4u"></div></div></div>`);
+  var root_72 = from_html(`<div class="field-group svelte-1nhql4u"><div class="empty-inline svelte-1nhql4u">No saved positions yet.</div></div>`);
+  var root_74 = from_html(`<div class="pos-item svelte-1nhql4u"><div class="pos-name svelte-1nhql4u"> </div> <div class="pos-coords mono svelte-1nhql4u"> </div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-xs btn-accent svelte-1nhql4u">\u2197 Apply to Selected</button> <button class="btn btn-xs btn-danger svelte-1nhql4u">\u2715</button></div></div>`);
+  var root_73 = from_html(`<div class="pos-list svelte-1nhql4u"></div>`);
+  var root_71 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Saved Positions</div> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm svelte-1nhql4u">\u2295 Save Cursor</button> <button class="btn btn-sm svelte-1nhql4u">\u2295 Save Selected</button></div> <!></div>`);
+  var root_76 = from_html(`<span class="dirty svelte-1nhql4u">\u25CF unsaved</span>`);
+  var root_75 = from_html(`<div class="pane svelte-1nhql4u"><div class="pane-title svelte-1nhql4u">Import / Export</div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">Auto Map Import</div> <textarea class="json-area mono svelte-1nhql4u" rows="3" placeholder="Paste JSON map string here for window.global.importMap(...) (Enter to run, Shift+Enter for newline)\u2026"></textarea> <div class="row gap-8 svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u21BB Run window.global.importMap(json)</button></div></div> <div class="io-actions svelte-1nhql4u"><button class="btn btn-sm btn-accent svelte-1nhql4u">\u2193 Export JSON</button> <button> </button> <button class="btn btn-sm svelte-1nhql4u">\u2191 Load from Text</button> <label class="btn btn-sm btn-file svelte-1nhql4u" title="Import from .json file">\u2295 Import File <input type="file" accept="application/json,.json" class="svelte-1nhql4u"/></label> <button class="btn btn-sm btn-danger svelte-1nhql4u">\u2715 Clear All</button></div> <div class="field-group svelte-1nhql4u"><div class="field-label svelte-1nhql4u">JSON</div> <textarea class="json-area mono svelte-1nhql4u" placeholder="Paste JSON here to load, or copy/export to populate\u2026"></textarea></div> <div class="io-meta svelte-1nhql4u"><span class="svelte-1nhql4u"> </span> <span class="svelte-1nhql4u">\xB7</span> <span class="svelte-1nhql4u"> </span> <!></div></div>`);
   var root = from_html(`<div class="shell svelte-1nhql4u"><aside class="rail svelte-1nhql4u"><div class="rail-head svelte-1nhql4u"><div class="rail-head-top svelte-1nhql4u"><span class="logo-mark svelte-1nhql4u">\u2B21</span> <span class="logo-text svelte-1nhql4u">CONSTRAINT RACK</span> <button class="close-btn svelte-1nhql4u" title="Close (Esc)">\u2715</button></div> <div class="map-badge svelte-1nhql4u"><span></span> <span class="map-name svelte-1nhql4u"> </span> <span class="map-mode svelte-1nhql4u"> </span></div></div> <div class="rail-toolbar svelte-1nhql4u"><div class="add-row svelte-1nhql4u"><select class="type-select svelte-1nhql4u"></select> <button class="btn btn-add svelte-1nhql4u" title="Add constraint (A)">+ Add</button></div> <button title="Start Jump Train \u2014 click nodes on map (Enter/Esc to finish)"><!></button> <button title="Click map to place (Esc to cancel)"><!></button> <input class="search-input svelte-1nhql4u" placeholder="Filter constraints\u2026"/></div> <div class="stats-bar svelte-1nhql4u"><span class="stat svelte-1nhql4u"> </span> <span class="stat stat-on svelte-1nhql4u"> </span> <!></div> <div class="clist svelte-1nhql4u"><!> <!> <div class="drop-zone svelte-1nhql4u" role="button" tabindex="-1">\u2193 drop to move to end</div></div></aside> <section class="main svelte-1nhql4u"><nav class="tabs svelte-1nhql4u"><!> <div class="tabs-spacer svelte-1nhql4u"></div> <div class="undo-redo svelte-1nhql4u"><button class="btn btn-icon svelte-1nhql4u" title="Undo (Ctrl+Z)">\u21A9</button> <button class="btn btn-icon svelte-1nhql4u" title="Redo (Ctrl+Y)">\u21AA</button></div></nav> <div class="tab-body svelte-1nhql4u"><!> <!> <!> <!></div></section></div>`);
   var $$css = {
     hash: "svelte-1nhql4u",
@@ -23141,6 +23221,7 @@ ${component_stack}
     const usesJumpArc = mutable_source();
     const usesJumpTrain = mutable_source();
     const showSpeedWindow = mutable_source();
+    const showSpeedLockedBox = mutable_source();
     const showTurn = mutable_source();
     const showState = mutable_source();
     const showLookDirection = mutable_source();
@@ -23192,6 +23273,7 @@ ${component_stack}
       "yawMax",
       "minSpeed",
       "maxSpeed",
+      "unlockSpeed",
       "targetYaw",
       "maxDeltaRad",
       "takeoffCx",
@@ -23212,6 +23294,7 @@ ${component_stack}
       "landingSizeZ"
     ]);
     const SEGMENT_HITBOX_TYPES = ["sphere", "cylinder", "box"];
+    const SPEED_DISPLAY_SCALE = 1e3;
     let editLabel = mutable_source("");
     let editType = mutable_source("HardCheckpoint");
     let editConstraint = mutable_source({});
@@ -23241,6 +23324,7 @@ ${component_stack}
       LookDirection: "#bc8cff",
       LookRange: "#a371f7",
       SpeedWindow: "#f2cc60",
+      SpeedLockedBox: "#7ee787",
       VelocityDirection: "#e3b341",
       TurnConstraint: "#d29922",
       StateCheckpoint: "#ff7b72"
@@ -23259,6 +23343,7 @@ ${component_stack}
       LookDirection: "\u27A4",
       LookRange: "\u2316",
       SpeedWindow: "\u26A1",
+      SpeedLockedBox: "\u25A3",
       VelocityDirection: "\u2197",
       TurnConstraint: "\u21BB",
       StateCheckpoint: "\u25C8"
@@ -23327,13 +23412,24 @@ ${component_stack}
       set(editConstraint, nextConstraint);
       commitLiveConstraint(get2(editLabel), get2(editType), nextConstraint);
     }
+    function speedToDisplay(value, fallback2 = 0) {
+      const n = Number(value);
+      const scaled = (Number.isFinite(n) ? n : fallback2) * SPEED_DISPLAY_SCALE;
+      return Number(scaled.toFixed(2));
+    }
+    function displayToSpeed(value, fallback2 = 0) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n / SPEED_DISPLAY_SCALE : fallback2;
+    }
     function updateEditLabel(value) {
       set(editLabel, value);
       commitLiveConstraint(value, get2(editType), get2(editConstraint));
     }
     function updateEditType(value) {
+      const nextConstraint = value === "SpeedLockedBox" ? { ...get2(editConstraint), hitboxType: "box" } : get2(editConstraint);
       set(editType, value);
-      commitLiveConstraint(get2(editLabel), value, get2(editConstraint));
+      set(editConstraint, nextConstraint);
+      commitLiveConstraint(get2(editLabel), value, nextConstraint);
     }
     function applySelected() {
       if (!get2(selected) || get2(usesJumpTrain)) return;
@@ -23471,10 +23567,41 @@ ${component_stack}
     function nudge(x, y, z) {
       store().nudgeSelected({ x, y, z });
     }
-    function onDragStart(event2, id) {
-      set(draggingId, id);
+    function getConstraintIndexForRow(record) {
+      if (record?.isVirtualTrainGroup) {
+        const group = store().getTrainGroupView(record.id);
+        const firstArcId = group?.arcIds?.[0] || null;
+        if (!firstArcId) {
+          return -1;
+        }
+        return get2(state2).constraints.findIndex((c) => c.id === firstArcId);
+      }
+      if (record?.isVirtualTrainArc && record?.targetConstraintId) {
+        return get2(state2).constraints.findIndex((c) => c.id === record.targetConstraintId);
+      }
+      return get2(state2).constraints.findIndex((c) => c.id === record?.id);
+    }
+    function parseDragPayload(raw) {
+      const token = String(raw || "");
+      if (!token) return null;
+      if (token.startsWith("group:")) {
+        const groupId = token.slice("group:".length);
+        return groupId ? { kind: "group", id: groupId } : null;
+      }
+      if (token.startsWith("constraint:")) {
+        const id = token.slice("constraint:".length);
+        return id ? { kind: "constraint", id } : null;
+      }
+      if (get2(state2).constraints.some((c) => c.id === token)) {
+        return { kind: "constraint", id: token };
+      }
+      return null;
+    }
+    function onDragStart(event2, record) {
+      if (!record || record.isVirtualTrainArc) return;
+      set(draggingId, record.isVirtualTrainGroup ? `group:${record.id}` : `constraint:${record.id}`);
       event2.dataTransfer.effectAllowed = "move";
-      event2.dataTransfer.setData("text/plain", id);
+      event2.dataTransfer.setData("text/plain", get2(draggingId));
     }
     function onDragOver(event2, id) {
       event2.preventDefault();
@@ -23482,29 +23609,41 @@ ${component_stack}
     }
     function onDropOnItem(event2, targetRecord) {
       event2.preventDefault();
-      const id = get2(draggingId) || event2.dataTransfer.getData("text/plain");
-      const targetId = targetRecord?.targetConstraintId || targetRecord?.id;
-      if (!id || !targetId || id === targetId) {
+      const drag = parseDragPayload(get2(draggingId) || event2.dataTransfer.getData("text/plain"));
+      const target = getConstraintIndexForRow(targetRecord);
+      if (!drag || target < 0) {
         set(draggingId, set(dragOverId, null));
         return;
       }
-      const from = get2(state2).constraints.findIndex((c) => c.id === id);
-      const target = get2(state2).constraints.findIndex((c) => c.id === targetId);
-      if (from < 0 || target < 0) {
+      if (drag.kind === "group") {
+        if (targetRecord?.isVirtualTrainGroup && targetRecord.id === drag.id) {
+          set(draggingId, set(dragOverId, null));
+          return;
+        }
+        store().moveTrainGroupToIndex(drag.id, target);
         set(draggingId, set(dragOverId, null));
         return;
       }
-      store().moveConstraintToIndex(id, from < target ? target - 1 : target);
+      const from = get2(state2).constraints.findIndex((c) => c.id === drag.id);
+      if (from < 0) {
+        set(draggingId, set(dragOverId, null));
+        return;
+      }
+      store().moveConstraintToIndex(drag.id, from < target ? target - 1 : target);
       set(draggingId, set(dragOverId, null));
     }
     function onDropToEnd(event2) {
       event2.preventDefault();
-      const id = get2(draggingId) || event2.dataTransfer.getData("text/plain");
-      if (!id) {
+      const drag = parseDragPayload(get2(draggingId) || event2.dataTransfer.getData("text/plain"));
+      if (!drag) {
         set(draggingId, set(dragOverId, null));
         return;
       }
-      store().moveConstraintToIndex(id, get2(state2).constraints.length - 1);
+      if (drag.kind === "group") {
+        store().moveTrainGroupToIndex(drag.id, get2(state2).constraints.length);
+      } else {
+        store().moveConstraintToIndex(drag.id, get2(state2).constraints.length - 1);
+      }
       set(draggingId, set(dragOverId, null));
     }
     function selectListItem(record) {
@@ -23535,9 +23674,12 @@ ${component_stack}
     legacy_pre_effect(() => (get2(selected), get2(state2)), () => {
       set(selectedTrainGroupId, isTrainArcRecord(get2(selected)) ? get2(selected).constraint.trainGroupId : get2(state2).trainPlacementGroupId || null);
     });
-    legacy_pre_effect(() => (get2(selectedTrainGroupId), deep_read_state(store())), () => {
-      set(selectedTrainGroup, get2(selectedTrainGroupId) ? store().getTrainGroupView(get2(selectedTrainGroupId)) : null);
-    });
+    legacy_pre_effect(
+      () => (get2(state2), get2(selectedTrainGroupId), deep_read_state(store())),
+      () => {
+        set(selectedTrainGroup, (get2(state2).constraints, get2(selectedTrainGroupId) ? store().getTrainGroupView(get2(selectedTrainGroupId)) : null));
+      }
+    );
     legacy_pre_effect(() => (get2(selectedTrainGroupId), get2(selected)), () => {
       set(trainEditorTargetId, get2(selectedTrainGroupId) || get2(selected)?.id || null);
     });
@@ -23605,7 +23747,7 @@ ${component_stack}
       set(isAirborneSegment, get2(selectedType) === "AirborneSegment");
     });
     legacy_pre_effect(() => get2(selectedType), () => {
-      set(usesSingleZone, get2(selectedType) === "HardCheckpoint" || get2(selectedType) === "SoftCheckpoint" || get2(selectedType) === "TakeoffZone" || get2(selectedType) === "LandingZone" || get2(selectedType) === "PlaneCheckpoint");
+      set(usesSingleZone, get2(selectedType) === "HardCheckpoint" || get2(selectedType) === "SoftCheckpoint" || get2(selectedType) === "TakeoffZone" || get2(selectedType) === "LandingZone" || get2(selectedType) === "PlaneCheckpoint" || get2(selectedType) === "SpeedLockedBox");
     });
     legacy_pre_effect(() => get2(selectedType), () => {
       set(usesDirection, get2(selectedType) === "PlaneCheckpoint" || get2(selectedType) === "LookDirection" || get2(selectedType) === "LookRange" || get2(selectedType) === "VelocityDirection");
@@ -23618,6 +23760,9 @@ ${component_stack}
     });
     legacy_pre_effect(() => get2(selectedType), () => {
       set(showSpeedWindow, get2(selectedType) === "SpeedWindow");
+    });
+    legacy_pre_effect(() => get2(selectedType), () => {
+      set(showSpeedLockedBox, get2(selectedType) === "SpeedLockedBox");
     });
     legacy_pre_effect(() => get2(selectedType), () => {
       set(showTurn, get2(selectedType) === "TurnConstraint");
@@ -23879,7 +24024,7 @@ ${component_stack}
       reset(button_4);
       template_effect(
         ($0, $1, $2) => {
-          set_attribute2(button_4, "draggable", (get2(record), untrack(() => !get2(record).isVirtualTrainGroup && !get2(record).isVirtualTrainArc)));
+          set_attribute2(button_4, "draggable", (get2(record), untrack(() => !get2(record).isVirtualTrainArc)));
           classes_3 = set_class(button_4, 1, "citem svelte-1nhql4u", null, classes_3, {
             "train-child": get2(record).isVirtualTrainArc,
             selected: get2(record).isVirtualTrainGroup ? get2(selectedTrainGroupId) === get2(record).id : get2(record).isVirtualTrainArc ? get2(record).targetConstraintId === get2(state2).selectedConstraintId : get2(record).id === get2(state2).selectedConstraintId,
@@ -23892,7 +24037,7 @@ ${component_stack}
           set_text(text_9, $2);
           set_text(text_10, (get2(record), untrack(() => get2(record).label || "Unnamed")));
           set_text(text_11, (get2(record), untrack(() => get2(record).constraint.type)));
-          set_text(text_12, (get2(record), untrack(() => get2(record).isVirtualTrainGroup || get2(record).isVirtualTrainArc ? "" : "\u283F")));
+          set_text(text_12, (get2(record), untrack(() => get2(record).isVirtualTrainArc ? "" : "\u283F")));
         },
         [
           () => (get2(record), untrack(() => typeColor2(get2(record).constraint.type))),
@@ -23900,9 +24045,9 @@ ${component_stack}
           () => (get2(record), untrack(() => typeIcon(get2(record).constraint.type)))
         ]
       );
-      event("dragstart", button_4, (e) => !get2(record).isVirtualTrainGroup && !get2(record).isVirtualTrainArc && onDragStart(e, get2(record).id));
-      event("dragover", button_4, (e) => !get2(record).isVirtualTrainGroup && onDragOver(e, get2(record).id));
-      event("drop", button_4, (e) => !get2(record).isVirtualTrainGroup && onDropOnItem(e, get2(record)));
+      event("dragstart", button_4, (e) => onDragStart(e, get2(record)));
+      event("dragover", button_4, (e) => onDragOver(e, get2(record).id));
+      event("drop", button_4, (e) => onDropOnItem(e, get2(record)));
       event("dragend", button_4, () => {
         set(draggingId, null);
         set(dragOverId, null);
@@ -23963,11 +24108,11 @@ ${component_stack}
     var div_11 = sibling(nav, 2);
     var node_8 = child(div_11);
     {
-      var consequent_41 = ($$anchor2) => {
+      var consequent_43 = ($$anchor2) => {
         var fragment_2 = comment();
         var node_9 = first_child(fragment_2);
         {
-          var consequent_40 = ($$anchor3) => {
+          var consequent_42 = ($$anchor3) => {
             var div_12 = root_13();
             var div_13 = child(div_12);
             var span_14 = child(div_13);
@@ -24100,42 +24245,21 @@ ${component_stack}
             }
             var node_13 = sibling(node_12, 2);
             {
-              var consequent_11 = ($$anchor4) => {
+              var consequent_12 = ($$anchor4) => {
                 var div_29 = root_18();
-                var div_30 = sibling(child(div_29), 2);
-                var select_2 = child(div_30);
-                each(select_2, 5, () => HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_2 = root_19();
-                  var text_19 = child(option_2, true);
-                  reset(option_2);
-                  var option_2_value = {};
-                  template_effect(() => {
-                    set_text(text_19, get2(shape));
-                    if (option_2_value !== (option_2_value = get2(shape))) {
-                      option_2.value = (option_2.__value = get2(shape)) ?? "";
-                    }
-                  });
-                  append($$anchor5, option_2);
-                });
-                reset(select_2);
-                var select_2_value;
-                init_select(select_2);
-                reset(div_30);
-                var node_14 = sibling(div_30, 2);
+                var node_14 = sibling(child(div_29), 2);
                 {
                   var consequent_9 = ($$anchor5) => {
-                    var div_31 = root_20();
-                    var input_8 = child(div_31);
+                    var fragment_3 = root_19();
+                    var div_30 = first_child(fragment_3);
+                    var button_12 = child(div_30);
+                    reset(div_30);
+                    var div_31 = sibling(div_30, 2);
+                    var div_32 = child(div_31);
+                    var input_8 = sibling(child(div_32), 2);
                     remove_input_defaults(input_8);
-                    next(2);
-                    reset(div_31);
-                    template_effect(() => set_value(input_8, (get2(editConstraint), untrack(() => get2(editConstraint).radius ?? 8))));
-                    event("input", input_8, (e) => updateEditField("radius", e.currentTarget.value));
-                    append($$anchor5, div_31);
-                  };
-                  var consequent_10 = ($$anchor5) => {
-                    var div_32 = root_21();
-                    var div_33 = child(div_32);
+                    reset(div_32);
+                    var div_33 = sibling(div_32, 2);
                     var input_9 = sibling(child(div_33), 2);
                     remove_input_defaults(input_9);
                     reset(div_33);
@@ -24143,113 +24267,175 @@ ${component_stack}
                     var input_10 = sibling(child(div_34), 2);
                     remove_input_defaults(input_10);
                     reset(div_34);
-                    reset(div_32);
+                    reset(div_31);
                     template_effect(() => {
-                      set_value(input_9, (get2(editConstraint), untrack(() => get2(editConstraint).radius ?? 8)));
-                      set_value(input_10, (get2(editConstraint), untrack(() => get2(editConstraint).height ?? 6)));
-                    });
-                    event("input", input_9, (e) => updateEditField("radius", e.currentTarget.value));
-                    event("input", input_10, (e) => updateEditField("height", e.currentTarget.value));
-                    append($$anchor5, div_32);
-                  };
-                  var alternate_2 = ($$anchor5) => {
-                    var fragment_3 = root_22();
-                    var div_35 = first_child(fragment_3);
-                    var button_12 = child(div_35);
-                    reset(div_35);
-                    var div_36 = sibling(div_35, 2);
-                    var div_37 = child(div_36);
-                    var input_11 = sibling(child(div_37), 2);
-                    remove_input_defaults(input_11);
-                    reset(div_37);
-                    var div_38 = sibling(div_37, 2);
-                    var input_12 = sibling(child(div_38), 2);
-                    remove_input_defaults(input_12);
-                    reset(div_38);
-                    var div_39 = sibling(div_38, 2);
-                    var input_13 = sibling(child(div_39), 2);
-                    remove_input_defaults(input_13);
-                    reset(div_39);
-                    reset(div_36);
-                    template_effect(() => {
-                      set_value(input_11, (get2(editConstraint), untrack(() => get2(editConstraint).sizeX ?? 8)));
-                      set_value(input_12, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
-                      set_value(input_13, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
+                      set_value(input_8, (get2(editConstraint), untrack(() => get2(editConstraint).sizeX ?? 8)));
+                      set_value(input_9, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
+                      set_value(input_10, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
                     });
                     event("click", button_12, () => beginRaycastPlacement("size"));
-                    event("input", input_11, (e) => updateEditField("sizeX", e.currentTarget.value));
-                    event("input", input_12, (e) => updateEditField("sizeY", e.currentTarget.value));
-                    event("input", input_13, (e) => updateEditField("sizeZ", e.currentTarget.value));
+                    event("input", input_8, (e) => updateEditField("sizeX", e.currentTarget.value));
+                    event("input", input_9, (e) => updateEditField("sizeY", e.currentTarget.value));
+                    event("input", input_10, (e) => updateEditField("sizeZ", e.currentTarget.value));
                     append($$anchor5, fragment_3);
                   };
+                  var alternate_3 = ($$anchor5) => {
+                    var fragment_4 = root_20();
+                    var div_35 = first_child(fragment_4);
+                    var select_2 = child(div_35);
+                    each(select_2, 5, () => HITBOX_TYPES, index, ($$anchor6, shape) => {
+                      var option_2 = root_21();
+                      var text_19 = child(option_2, true);
+                      reset(option_2);
+                      var option_2_value = {};
+                      template_effect(() => {
+                        set_text(text_19, get2(shape));
+                        if (option_2_value !== (option_2_value = get2(shape))) {
+                          option_2.value = (option_2.__value = get2(shape)) ?? "";
+                        }
+                      });
+                      append($$anchor6, option_2);
+                    });
+                    reset(select_2);
+                    var select_2_value;
+                    init_select(select_2);
+                    reset(div_35);
+                    var node_15 = sibling(div_35, 2);
+                    {
+                      var consequent_10 = ($$anchor6) => {
+                        var div_36 = root_22();
+                        var input_11 = child(div_36);
+                        remove_input_defaults(input_11);
+                        next(2);
+                        reset(div_36);
+                        template_effect(() => set_value(input_11, (get2(editConstraint), untrack(() => get2(editConstraint).radius ?? 8))));
+                        event("input", input_11, (e) => updateEditField("radius", e.currentTarget.value));
+                        append($$anchor6, div_36);
+                      };
+                      var consequent_11 = ($$anchor6) => {
+                        var div_37 = root_23();
+                        var div_38 = child(div_37);
+                        var input_12 = sibling(child(div_38), 2);
+                        remove_input_defaults(input_12);
+                        reset(div_38);
+                        var div_39 = sibling(div_38, 2);
+                        var input_13 = sibling(child(div_39), 2);
+                        remove_input_defaults(input_13);
+                        reset(div_39);
+                        reset(div_37);
+                        template_effect(() => {
+                          set_value(input_12, (get2(editConstraint), untrack(() => get2(editConstraint).radius ?? 8)));
+                          set_value(input_13, (get2(editConstraint), untrack(() => get2(editConstraint).height ?? 6)));
+                        });
+                        event("input", input_12, (e) => updateEditField("radius", e.currentTarget.value));
+                        event("input", input_13, (e) => updateEditField("height", e.currentTarget.value));
+                        append($$anchor6, div_37);
+                      };
+                      var alternate_2 = ($$anchor6) => {
+                        var fragment_5 = root_24();
+                        var div_40 = first_child(fragment_5);
+                        var button_13 = child(div_40);
+                        reset(div_40);
+                        var div_41 = sibling(div_40, 2);
+                        var div_42 = child(div_41);
+                        var input_14 = sibling(child(div_42), 2);
+                        remove_input_defaults(input_14);
+                        reset(div_42);
+                        var div_43 = sibling(div_42, 2);
+                        var input_15 = sibling(child(div_43), 2);
+                        remove_input_defaults(input_15);
+                        reset(div_43);
+                        var div_44 = sibling(div_43, 2);
+                        var input_16 = sibling(child(div_44), 2);
+                        remove_input_defaults(input_16);
+                        reset(div_44);
+                        reset(div_41);
+                        template_effect(() => {
+                          set_value(input_14, (get2(editConstraint), untrack(() => get2(editConstraint).sizeX ?? 8)));
+                          set_value(input_15, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
+                          set_value(input_16, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
+                        });
+                        event("click", button_13, () => beginRaycastPlacement("size"));
+                        event("input", input_14, (e) => updateEditField("sizeX", e.currentTarget.value));
+                        event("input", input_15, (e) => updateEditField("sizeY", e.currentTarget.value));
+                        event("input", input_16, (e) => updateEditField("sizeZ", e.currentTarget.value));
+                        append($$anchor6, fragment_5);
+                      };
+                      if_block(node_15, ($$render) => {
+                        if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "sphere" || (get2(editConstraint).hitboxType || "sphere") === "circle")) $$render(consequent_10);
+                        else if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "cylinder")) $$render(consequent_11, 1);
+                        else $$render(alternate_2, -1);
+                      });
+                    }
+                    template_effect(() => {
+                      if (select_2_value !== (select_2_value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "sphere")))) {
+                        select_2.value = (select_2.__value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "sphere"))) ?? "", select_option(select_2, (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "sphere")));
+                      }
+                    });
+                    event("change", select_2, (e) => updateEditField("hitboxType", e.currentTarget.value));
+                    append($$anchor5, fragment_4);
+                  };
                   if_block(node_14, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "sphere" || (get2(editConstraint).hitboxType || "sphere") === "circle")) $$render(consequent_9);
-                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "sphere") === "cylinder")) $$render(consequent_10, 1);
-                    else $$render(alternate_2, -1);
+                    if (get2(selectedType) === "SpeedLockedBox") $$render(consequent_9);
+                    else $$render(alternate_3, -1);
                   });
                 }
                 reset(div_29);
-                template_effect(() => {
-                  if (select_2_value !== (select_2_value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "sphere")))) {
-                    select_2.value = (select_2.__value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "sphere"))) ?? "", select_option(select_2, (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "sphere")));
-                  }
-                });
-                event("change", select_2, (e) => updateEditField("hitboxType", e.currentTarget.value));
                 append($$anchor4, div_29);
               };
               if_block(node_13, ($$render) => {
-                if (get2(usesSingleZone)) $$render(consequent_11);
+                if (get2(usesSingleZone)) $$render(consequent_12);
               });
             }
-            var node_15 = sibling(node_13, 2);
+            var node_16 = sibling(node_13, 2);
             {
-              var consequent_14 = ($$anchor4) => {
-                var fragment_4 = root_23();
-                var div_40 = first_child(fragment_4);
-                var div_41 = child(div_40);
-                var div_42 = sibling(child(div_41), 2);
-                var button_13 = child(div_42);
-                reset(div_42);
-                reset(div_41);
-                var div_43 = sibling(div_41, 2);
-                var div_44 = child(div_43);
-                var input_14 = sibling(child(div_44), 2);
-                remove_input_defaults(input_14);
-                reset(div_44);
-                var div_45 = sibling(div_44, 2);
-                var input_15 = sibling(child(div_45), 2);
-                remove_input_defaults(input_15);
-                reset(div_45);
-                var div_46 = sibling(div_45, 2);
-                var input_16 = sibling(child(div_46), 2);
-                remove_input_defaults(input_16);
+              var consequent_15 = ($$anchor4) => {
+                var fragment_6 = root_25();
+                var div_45 = first_child(fragment_6);
+                var div_46 = child(div_45);
+                var div_47 = sibling(child(div_46), 2);
+                var button_14 = child(div_47);
+                reset(div_47);
                 reset(div_46);
-                reset(div_43);
-                reset(div_40);
-                var div_47 = sibling(div_40, 2);
-                var div_48 = child(div_47);
-                var div_49 = sibling(child(div_48), 2);
-                var button_14 = child(div_49);
-                reset(div_49);
-                reset(div_48);
-                var div_50 = sibling(div_48, 2);
-                var div_51 = child(div_50);
-                var input_17 = sibling(child(div_51), 2);
+                var div_48 = sibling(div_46, 2);
+                var div_49 = child(div_48);
+                var input_17 = sibling(child(div_49), 2);
                 remove_input_defaults(input_17);
-                reset(div_51);
-                var div_52 = sibling(div_51, 2);
-                var input_18 = sibling(child(div_52), 2);
+                reset(div_49);
+                var div_50 = sibling(div_49, 2);
+                var input_18 = sibling(child(div_50), 2);
                 remove_input_defaults(input_18);
-                reset(div_52);
-                var div_53 = sibling(div_52, 2);
-                var input_19 = sibling(child(div_53), 2);
-                remove_input_defaults(input_19);
-                reset(div_53);
                 reset(div_50);
-                var div_54 = sibling(div_50, 2);
-                var select_3 = child(div_54);
+                var div_51 = sibling(div_50, 2);
+                var input_19 = sibling(child(div_51), 2);
+                remove_input_defaults(input_19);
+                reset(div_51);
+                reset(div_48);
+                reset(div_45);
+                var div_52 = sibling(div_45, 2);
+                var div_53 = child(div_52);
+                var div_54 = sibling(child(div_53), 2);
+                var button_15 = child(div_54);
+                reset(div_54);
+                reset(div_53);
+                var div_55 = sibling(div_53, 2);
+                var div_56 = child(div_55);
+                var input_20 = sibling(child(div_56), 2);
+                remove_input_defaults(input_20);
+                reset(div_56);
+                var div_57 = sibling(div_56, 2);
+                var input_21 = sibling(child(div_57), 2);
+                remove_input_defaults(input_21);
+                reset(div_57);
+                var div_58 = sibling(div_57, 2);
+                var input_22 = sibling(child(div_58), 2);
+                remove_input_defaults(input_22);
+                reset(div_58);
+                reset(div_55);
+                var div_59 = sibling(div_55, 2);
+                var select_3 = child(div_59);
                 each(select_3, 5, () => SEGMENT_HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_3 = root_24();
+                  var option_3 = root_26();
                   var text_20 = child(option_3, true);
                   reset(option_3);
                   var option_3_value = {};
@@ -24264,142 +24450,142 @@ ${component_stack}
                 reset(select_3);
                 var select_3_value;
                 init_select(select_3);
-                reset(div_54);
-                var node_16 = sibling(div_54, 2);
+                reset(div_59);
+                var node_17 = sibling(div_59, 2);
                 {
-                  var consequent_13 = ($$anchor5) => {
-                    var fragment_5 = comment();
-                    var node_17 = first_child(fragment_5);
+                  var consequent_14 = ($$anchor5) => {
+                    var fragment_7 = comment();
+                    var node_18 = first_child(fragment_7);
                     {
-                      var consequent_12 = ($$anchor6) => {
-                        var div_55 = root_26();
-                        append($$anchor6, div_55);
+                      var consequent_13 = ($$anchor6) => {
+                        var div_60 = root_28();
+                        append($$anchor6, div_60);
                       };
-                      var alternate_3 = ($$anchor6) => {
-                        var fragment_6 = root_27();
-                        var div_56 = first_child(fragment_6);
-                        var button_15 = child(div_56);
-                        reset(div_56);
-                        var div_57 = sibling(div_56, 2);
-                        var div_58 = child(div_57);
-                        var input_20 = sibling(child(div_58), 2);
-                        remove_input_defaults(input_20);
-                        reset(div_58);
-                        var div_59 = sibling(div_58, 2);
-                        var input_21 = sibling(child(div_59), 2);
-                        remove_input_defaults(input_21);
-                        reset(div_59);
-                        var div_60 = sibling(div_59, 2);
-                        var input_22 = sibling(child(div_60), 2);
-                        remove_input_defaults(input_22);
-                        reset(div_60);
-                        reset(div_57);
+                      var alternate_4 = ($$anchor6) => {
+                        var fragment_8 = root_29();
+                        var div_61 = first_child(fragment_8);
+                        var button_16 = child(div_61);
+                        reset(div_61);
+                        var div_62 = sibling(div_61, 2);
+                        var div_63 = child(div_62);
+                        var input_23 = sibling(child(div_63), 2);
+                        remove_input_defaults(input_23);
+                        reset(div_63);
+                        var div_64 = sibling(div_63, 2);
+                        var input_24 = sibling(child(div_64), 2);
+                        remove_input_defaults(input_24);
+                        reset(div_64);
+                        var div_65 = sibling(div_64, 2);
+                        var input_25 = sibling(child(div_65), 2);
+                        remove_input_defaults(input_25);
+                        reset(div_65);
+                        reset(div_62);
                         template_effect(() => {
-                          set_value(input_20, (get2(editConstraint), untrack(() => get2(editConstraint).sizeX ?? 8)));
-                          set_value(input_21, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
-                          set_value(input_22, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
+                          set_value(input_23, (get2(editConstraint), untrack(() => get2(editConstraint).sizeX ?? 8)));
+                          set_value(input_24, (get2(editConstraint), untrack(() => get2(editConstraint).sizeY ?? 8)));
+                          set_value(input_25, (get2(editConstraint), untrack(() => get2(editConstraint).sizeZ ?? 8)));
                         });
-                        event("click", button_15, () => beginRaycastPlacement("segmentSize"));
-                        event("input", input_20, (e) => updateEditField("sizeX", e.currentTarget.value));
-                        event("input", input_21, (e) => updateEditField("sizeY", e.currentTarget.value));
-                        event("input", input_22, (e) => updateEditField("sizeZ", e.currentTarget.value));
-                        append($$anchor6, fragment_6);
+                        event("click", button_16, () => beginRaycastPlacement("segmentSize"));
+                        event("input", input_23, (e) => updateEditField("sizeX", e.currentTarget.value));
+                        event("input", input_24, (e) => updateEditField("sizeY", e.currentTarget.value));
+                        event("input", input_25, (e) => updateEditField("sizeZ", e.currentTarget.value));
+                        append($$anchor6, fragment_8);
                       };
-                      if_block(node_17, ($$render) => {
-                        if (get2(isAirborneSegment)) $$render(consequent_12);
-                        else $$render(alternate_3, -1);
+                      if_block(node_18, ($$render) => {
+                        if (get2(isAirborneSegment)) $$render(consequent_13);
+                        else $$render(alternate_4, -1);
                       });
                     }
-                    append($$anchor5, fragment_5);
+                    append($$anchor5, fragment_7);
                   };
-                  var alternate_4 = ($$anchor5) => {
-                    var div_61 = root_28();
-                    var input_23 = child(div_61);
-                    remove_input_defaults(input_23);
+                  var alternate_5 = ($$anchor5) => {
+                    var div_66 = root_30();
+                    var input_26 = child(div_66);
+                    remove_input_defaults(input_26);
                     next(2);
-                    reset(div_61);
-                    template_effect(() => set_value(input_23, (get2(editConstraint), untrack(() => get2(editConstraint).radius ?? 8))));
-                    event("input", input_23, (e) => updateEditField("radius", e.currentTarget.value));
-                    append($$anchor5, div_61);
+                    reset(div_66);
+                    template_effect(() => set_value(input_26, (get2(editConstraint), untrack(() => get2(editConstraint).radius ?? 8))));
+                    event("input", input_26, (e) => updateEditField("radius", e.currentTarget.value));
+                    append($$anchor5, div_66);
                   };
-                  if_block(node_16, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "cylinder") === "box")) $$render(consequent_13);
-                    else $$render(alternate_4, -1);
+                  if_block(node_17, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).hitboxType || "cylinder") === "box")) $$render(consequent_14);
+                    else $$render(alternate_5, -1);
                   });
                 }
-                reset(div_47);
+                reset(div_52);
                 template_effect(() => {
-                  set_value(input_14, (get2(editConstraint), untrack(() => get2(editConstraint).ax ?? 0)));
-                  set_value(input_15, (get2(editConstraint), untrack(() => get2(editConstraint).ay ?? 0)));
-                  set_value(input_16, (get2(editConstraint), untrack(() => get2(editConstraint).az ?? 0)));
-                  set_value(input_17, (get2(editConstraint), untrack(() => get2(editConstraint).bx ?? 0)));
-                  set_value(input_18, (get2(editConstraint), untrack(() => get2(editConstraint).by ?? 0)));
-                  set_value(input_19, (get2(editConstraint), untrack(() => get2(editConstraint).bz ?? 0)));
+                  set_value(input_17, (get2(editConstraint), untrack(() => get2(editConstraint).ax ?? 0)));
+                  set_value(input_18, (get2(editConstraint), untrack(() => get2(editConstraint).ay ?? 0)));
+                  set_value(input_19, (get2(editConstraint), untrack(() => get2(editConstraint).az ?? 0)));
+                  set_value(input_20, (get2(editConstraint), untrack(() => get2(editConstraint).bx ?? 0)));
+                  set_value(input_21, (get2(editConstraint), untrack(() => get2(editConstraint).by ?? 0)));
+                  set_value(input_22, (get2(editConstraint), untrack(() => get2(editConstraint).bz ?? 0)));
                   if (select_3_value !== (select_3_value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "cylinder")))) {
                     select_3.value = (select_3.__value = (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "cylinder"))) ?? "", select_option(select_3, (get2(editConstraint), untrack(() => get2(editConstraint).hitboxType || "cylinder")));
                   }
                 });
-                event("click", button_13, () => beginRaycastPlacement("start"));
-                event("input", input_14, (e) => updateEditField("ax", e.currentTarget.value));
-                event("input", input_15, (e) => updateEditField("ay", e.currentTarget.value));
-                event("input", input_16, (e) => updateEditField("az", e.currentTarget.value));
-                event("click", button_14, () => beginRaycastPlacement("end"));
-                event("input", input_17, (e) => updateEditField("bx", e.currentTarget.value));
-                event("input", input_18, (e) => updateEditField("by", e.currentTarget.value));
-                event("input", input_19, (e) => updateEditField("bz", e.currentTarget.value));
+                event("click", button_14, () => beginRaycastPlacement("start"));
+                event("input", input_17, (e) => updateEditField("ax", e.currentTarget.value));
+                event("input", input_18, (e) => updateEditField("ay", e.currentTarget.value));
+                event("input", input_19, (e) => updateEditField("az", e.currentTarget.value));
+                event("click", button_15, () => beginRaycastPlacement("end"));
+                event("input", input_20, (e) => updateEditField("bx", e.currentTarget.value));
+                event("input", input_21, (e) => updateEditField("by", e.currentTarget.value));
+                event("input", input_22, (e) => updateEditField("bz", e.currentTarget.value));
                 event("change", select_3, (e) => updateEditField("hitboxType", e.currentTarget.value));
-                append($$anchor4, fragment_4);
+                append($$anchor4, fragment_6);
               };
-              if_block(node_15, ($$render) => {
-                if (get2(isSegmentType)) $$render(consequent_14);
+              if_block(node_16, ($$render) => {
+                if (get2(isSegmentType)) $$render(consequent_15);
               });
             }
-            var node_18 = sibling(node_15, 2);
+            var node_19 = sibling(node_16, 2);
             {
-              var consequent_15 = ($$anchor4) => {
-                var div_62 = root_29();
-                var div_63 = sibling(child(div_62), 2);
-                var input_24 = child(div_63);
-                remove_input_defaults(input_24);
-                next(2);
-                reset(div_63);
-                reset(div_62);
-                template_effect(() => set_value(input_24, (get2(editConstraint), untrack(() => get2(editConstraint).jumpYVel ?? 0.072))));
-                event("input", input_24, (e) => updateEditField("jumpYVel", e.currentTarget.value));
-                append($$anchor4, div_62);
-              };
-              if_block(node_18, ($$render) => {
-                if (get2(usesJumpArc)) $$render(consequent_15);
-              });
-            }
-            var node_19 = sibling(node_18, 2);
-            {
-              var consequent_23 = ($$anchor4) => {
-                var fragment_7 = root_30();
-                var div_64 = first_child(fragment_7);
-                var div_65 = child(div_64);
-                var div_66 = sibling(child(div_65), 2);
-                var button_16 = child(div_66);
-                reset(div_66);
-                reset(div_65);
-                var div_67 = sibling(div_65, 2);
-                var div_68 = child(div_67);
-                var input_25 = sibling(child(div_68), 2);
-                remove_input_defaults(input_25);
-                reset(div_68);
-                var div_69 = sibling(div_68, 2);
-                var input_26 = sibling(child(div_69), 2);
-                remove_input_defaults(input_26);
-                reset(div_69);
-                var div_70 = sibling(div_69, 2);
-                var input_27 = sibling(child(div_70), 2);
+              var consequent_16 = ($$anchor4) => {
+                var div_67 = root_31();
+                var div_68 = sibling(child(div_67), 2);
+                var input_27 = child(div_68);
                 remove_input_defaults(input_27);
-                reset(div_70);
+                next(2);
+                reset(div_68);
                 reset(div_67);
-                var div_71 = sibling(div_67, 2);
-                var select_4 = child(div_71);
+                template_effect(() => set_value(input_27, (get2(editConstraint), untrack(() => get2(editConstraint).jumpYVel ?? 0.072))));
+                event("input", input_27, (e) => updateEditField("jumpYVel", e.currentTarget.value));
+                append($$anchor4, div_67);
+              };
+              if_block(node_19, ($$render) => {
+                if (get2(usesJumpArc)) $$render(consequent_16);
+              });
+            }
+            var node_20 = sibling(node_19, 2);
+            {
+              var consequent_24 = ($$anchor4) => {
+                var fragment_9 = root_32();
+                var div_69 = first_child(fragment_9);
+                var div_70 = child(div_69);
+                var div_71 = sibling(child(div_70), 2);
+                var button_17 = child(div_71);
+                reset(div_71);
+                reset(div_70);
+                var div_72 = sibling(div_70, 2);
+                var div_73 = child(div_72);
+                var input_28 = sibling(child(div_73), 2);
+                remove_input_defaults(input_28);
+                reset(div_73);
+                var div_74 = sibling(div_73, 2);
+                var input_29 = sibling(child(div_74), 2);
+                remove_input_defaults(input_29);
+                reset(div_74);
+                var div_75 = sibling(div_74, 2);
+                var input_30 = sibling(child(div_75), 2);
+                remove_input_defaults(input_30);
+                reset(div_75);
+                reset(div_72);
+                var div_76 = sibling(div_72, 2);
+                var select_4 = child(div_76);
                 each(select_4, 5, () => HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_4 = root_31();
+                  var option_4 = root_33();
                   var text_21 = child(option_4, true);
                   reset(option_4);
                   var option_4_value = {};
@@ -24414,49 +24600,22 @@ ${component_stack}
                 reset(select_4);
                 var select_4_value;
                 init_select(select_4);
-                reset(div_71);
-                var node_20 = sibling(div_71, 2);
+                reset(div_76);
+                var node_21 = sibling(div_76, 2);
                 {
-                  var consequent_16 = ($$anchor5) => {
-                    var div_72 = root_32();
-                    var input_28 = child(div_72);
-                    remove_input_defaults(input_28);
-                    next(2);
-                    reset(div_72);
-                    template_effect(() => set_value(input_28, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffRadius ?? 8))));
-                    event("input", input_28, (e) => updateEditField("takeoffRadius", e.currentTarget.value));
-                    append($$anchor5, div_72);
-                  };
                   var consequent_17 = ($$anchor5) => {
-                    var div_73 = root_33();
-                    var div_74 = child(div_73);
-                    var input_29 = sibling(child(div_74), 2);
-                    remove_input_defaults(input_29);
-                    reset(div_74);
-                    var div_75 = sibling(div_74, 2);
-                    var input_30 = sibling(child(div_75), 2);
-                    remove_input_defaults(input_30);
-                    reset(div_75);
-                    reset(div_73);
-                    template_effect(() => {
-                      set_value(input_29, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffRadius ?? 8)));
-                      set_value(input_30, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHeight ?? 6)));
-                    });
-                    event("input", input_29, (e) => updateEditField("takeoffRadius", e.currentTarget.value));
-                    event("input", input_30, (e) => updateEditField("takeoffHeight", e.currentTarget.value));
-                    append($$anchor5, div_73);
-                  };
-                  var alternate_5 = ($$anchor5) => {
-                    var fragment_8 = root_34();
-                    var div_76 = first_child(fragment_8);
-                    var button_17 = child(div_76);
-                    reset(div_76);
-                    var div_77 = sibling(div_76, 2);
-                    var div_78 = child(div_77);
-                    var input_31 = sibling(child(div_78), 2);
+                    var div_77 = root_34();
+                    var input_31 = child(div_77);
                     remove_input_defaults(input_31);
-                    reset(div_78);
-                    var div_79 = sibling(div_78, 2);
+                    next(2);
+                    reset(div_77);
+                    template_effect(() => set_value(input_31, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffRadius ?? 8))));
+                    event("input", input_31, (e) => updateEditField("takeoffRadius", e.currentTarget.value));
+                    append($$anchor5, div_77);
+                  };
+                  var consequent_18 = ($$anchor5) => {
+                    var div_78 = root_35();
+                    var div_79 = child(div_78);
                     var input_32 = sibling(child(div_79), 2);
                     remove_input_defaults(input_32);
                     reset(div_79);
@@ -24464,52 +24623,79 @@ ${component_stack}
                     var input_33 = sibling(child(div_80), 2);
                     remove_input_defaults(input_33);
                     reset(div_80);
-                    reset(div_77);
+                    reset(div_78);
                     template_effect(() => {
-                      set_value(input_31, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeX ?? 8)));
-                      set_value(input_32, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeY ?? 8)));
-                      set_value(input_33, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeZ ?? 8)));
+                      set_value(input_32, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffRadius ?? 8)));
+                      set_value(input_33, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHeight ?? 6)));
                     });
-                    event("click", button_17, () => beginRaycastPlacement("takeoffSize"));
-                    event("input", input_31, (e) => updateEditField("takeoffSizeX", e.currentTarget.value));
-                    event("input", input_32, (e) => updateEditField("takeoffSizeY", e.currentTarget.value));
-                    event("input", input_33, (e) => updateEditField("takeoffSizeZ", e.currentTarget.value));
-                    append($$anchor5, fragment_8);
-                  };
-                  if_block(node_20, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "sphere" || (get2(editConstraint).takeoffHitboxType || "sphere") === "circle")) $$render(consequent_16);
-                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "cylinder")) $$render(consequent_17, 1);
-                    else $$render(alternate_5, -1);
-                  });
-                }
-                reset(div_64);
-                var div_81 = sibling(div_64, 2);
-                var div_82 = child(div_81);
-                var div_83 = sibling(child(div_82), 2);
-                var button_18 = child(div_83);
-                let classes_6;
-                var node_21 = child(button_18);
-                {
-                  var consequent_18 = ($$anchor5) => {
-                    var fragment_9 = root_35();
-                    next();
-                    append($$anchor5, fragment_9);
+                    event("input", input_32, (e) => updateEditField("takeoffRadius", e.currentTarget.value));
+                    event("input", input_33, (e) => updateEditField("takeoffHeight", e.currentTarget.value));
+                    append($$anchor5, div_78);
                   };
                   var alternate_6 = ($$anchor5) => {
-                    var text_22 = text("Sample Takeoff Spot");
-                    append($$anchor5, text_22);
+                    var fragment_10 = root_36();
+                    var div_81 = first_child(fragment_10);
+                    var button_18 = child(div_81);
+                    reset(div_81);
+                    var div_82 = sibling(div_81, 2);
+                    var div_83 = child(div_82);
+                    var input_34 = sibling(child(div_83), 2);
+                    remove_input_defaults(input_34);
+                    reset(div_83);
+                    var div_84 = sibling(div_83, 2);
+                    var input_35 = sibling(child(div_84), 2);
+                    remove_input_defaults(input_35);
+                    reset(div_84);
+                    var div_85 = sibling(div_84, 2);
+                    var input_36 = sibling(child(div_85), 2);
+                    remove_input_defaults(input_36);
+                    reset(div_85);
+                    reset(div_82);
+                    template_effect(() => {
+                      set_value(input_34, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeX ?? 8)));
+                      set_value(input_35, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeY ?? 8)));
+                      set_value(input_36, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSizeZ ?? 8)));
+                    });
+                    event("click", button_18, () => beginRaycastPlacement("takeoffSize"));
+                    event("input", input_34, (e) => updateEditField("takeoffSizeX", e.currentTarget.value));
+                    event("input", input_35, (e) => updateEditField("takeoffSizeY", e.currentTarget.value));
+                    event("input", input_36, (e) => updateEditField("takeoffSizeZ", e.currentTarget.value));
+                    append($$anchor5, fragment_10);
                   };
                   if_block(node_21, ($$render) => {
-                    if (get2(state2), untrack(() => get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample")) $$render(consequent_18);
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "sphere" || (get2(editConstraint).takeoffHitboxType || "sphere") === "circle")) $$render(consequent_17);
+                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).takeoffHitboxType || "sphere") === "cylinder")) $$render(consequent_18, 1);
                     else $$render(alternate_6, -1);
                   });
                 }
-                reset(button_18);
-                var node_22 = sibling(button_18, 2);
+                reset(div_69);
+                var div_86 = sibling(div_69, 2);
+                var div_87 = child(div_86);
+                var div_88 = sibling(child(div_87), 2);
+                var button_19 = child(div_88);
+                let classes_6;
+                var node_22 = child(button_19);
                 {
                   var consequent_19 = ($$anchor5) => {
-                    var button_19 = root_37();
-                    event("click", button_19, () => {
+                    var fragment_11 = root_37();
+                    next();
+                    append($$anchor5, fragment_11);
+                  };
+                  var alternate_7 = ($$anchor5) => {
+                    var text_22 = text("Sample Takeoff Spot");
+                    append($$anchor5, text_22);
+                  };
+                  if_block(node_22, ($$render) => {
+                    if (get2(state2), untrack(() => get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample")) $$render(consequent_19);
+                    else $$render(alternate_7, -1);
+                  });
+                }
+                reset(button_19);
+                var node_23 = sibling(button_19, 2);
+                {
+                  var consequent_20 = ($$anchor5) => {
+                    var button_20 = root_39();
+                    event("click", button_20, () => {
                       store().updateConstraint(get2(selected).id, {
                         constraint: {
                           takeoffSampleCx: null,
@@ -24524,37 +24710,37 @@ ${component_stack}
                         takeoffSampleCz: null
                       });
                     });
-                    append($$anchor5, button_19);
+                    append($$anchor5, button_20);
                   };
                   var d_1 = user_derived(() => (get2(editConstraint), untrack(() => Number.isFinite(get2(editConstraint).takeoffSampleCx))));
-                  if_block(node_22, ($$render) => {
-                    if (get2(d_1)) $$render(consequent_19);
+                  if_block(node_23, ($$render) => {
+                    if (get2(d_1)) $$render(consequent_20);
                   });
                 }
-                reset(div_83);
-                reset(div_82);
-                var node_23 = sibling(div_82, 2);
+                reset(div_88);
+                reset(div_87);
+                var node_24 = sibling(div_87, 2);
                 {
-                  var consequent_20 = ($$anchor5) => {
-                    var div_84 = root_38();
-                    var div_85 = child(div_84);
-                    var input_34 = sibling(child(div_85), 2);
-                    remove_input_defaults(input_34);
-                    reset(div_85);
-                    var div_86 = sibling(div_85, 2);
-                    var input_35 = sibling(child(div_86), 2);
-                    remove_input_defaults(input_35);
-                    reset(div_86);
-                    var div_87 = sibling(div_86, 2);
-                    var input_36 = sibling(child(div_87), 2);
-                    remove_input_defaults(input_36);
-                    reset(div_87);
-                    reset(div_84);
+                  var consequent_21 = ($$anchor5) => {
+                    var div_89 = root_40();
+                    var div_90 = child(div_89);
+                    var input_37 = sibling(child(div_90), 2);
+                    remove_input_defaults(input_37);
+                    reset(div_90);
+                    var div_91 = sibling(div_90, 2);
+                    var input_38 = sibling(child(div_91), 2);
+                    remove_input_defaults(input_38);
+                    reset(div_91);
+                    var div_92 = sibling(div_91, 2);
+                    var input_39 = sibling(child(div_92), 2);
+                    remove_input_defaults(input_39);
+                    reset(div_92);
+                    reset(div_89);
                     template_effect(
                       ($0, $1, $2) => {
-                        set_value(input_34, $0);
-                        set_value(input_35, $1);
-                        set_value(input_36, $2);
+                        set_value(input_37, $0);
+                        set_value(input_38, $1);
+                        set_value(input_39, $2);
                       },
                       [
                         () => (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSampleCx?.toFixed(2) ?? "")),
@@ -24562,43 +24748,43 @@ ${component_stack}
                         () => (get2(editConstraint), untrack(() => get2(editConstraint).takeoffSampleCz?.toFixed(2) ?? ""))
                       ]
                     );
-                    append($$anchor5, div_84);
+                    append($$anchor5, div_89);
                   };
                   var d_2 = user_derived(() => (get2(editConstraint), untrack(() => Number.isFinite(get2(editConstraint).takeoffSampleCx))));
-                  var alternate_7 = ($$anchor5) => {
-                    var div_88 = root_39();
-                    append($$anchor5, div_88);
+                  var alternate_8 = ($$anchor5) => {
+                    var div_93 = root_41();
+                    append($$anchor5, div_93);
                   };
-                  if_block(node_23, ($$render) => {
-                    if (get2(d_2)) $$render(consequent_20);
-                    else $$render(alternate_7, -1);
+                  if_block(node_24, ($$render) => {
+                    if (get2(d_2)) $$render(consequent_21);
+                    else $$render(alternate_8, -1);
                   });
                 }
-                reset(div_81);
-                var div_89 = sibling(div_81, 2);
-                var div_90 = child(div_89);
-                var div_91 = sibling(child(div_90), 2);
-                var button_20 = child(div_91);
-                reset(div_91);
-                reset(div_90);
-                var div_92 = sibling(div_90, 2);
-                var div_93 = child(div_92);
-                var input_37 = sibling(child(div_93), 2);
-                remove_input_defaults(input_37);
-                reset(div_93);
-                var div_94 = sibling(div_93, 2);
-                var input_38 = sibling(child(div_94), 2);
-                remove_input_defaults(input_38);
-                reset(div_94);
-                var div_95 = sibling(div_94, 2);
-                var input_39 = sibling(child(div_95), 2);
-                remove_input_defaults(input_39);
+                reset(div_86);
+                var div_94 = sibling(div_86, 2);
+                var div_95 = child(div_94);
+                var div_96 = sibling(child(div_95), 2);
+                var button_21 = child(div_96);
+                reset(div_96);
                 reset(div_95);
-                reset(div_92);
-                var div_96 = sibling(div_92, 2);
-                var select_5 = child(div_96);
+                var div_97 = sibling(div_95, 2);
+                var div_98 = child(div_97);
+                var input_40 = sibling(child(div_98), 2);
+                remove_input_defaults(input_40);
+                reset(div_98);
+                var div_99 = sibling(div_98, 2);
+                var input_41 = sibling(child(div_99), 2);
+                remove_input_defaults(input_41);
+                reset(div_99);
+                var div_100 = sibling(div_99, 2);
+                var input_42 = sibling(child(div_100), 2);
+                remove_input_defaults(input_42);
+                reset(div_100);
+                reset(div_97);
+                var div_101 = sibling(div_97, 2);
+                var select_5 = child(div_101);
                 each(select_5, 5, () => HITBOX_TYPES, index, ($$anchor5, shape) => {
-                  var option_5 = root_40();
+                  var option_5 = root_42();
                   var text_23 = child(option_5, true);
                   reset(option_5);
                   var option_5_value = {};
@@ -24613,49 +24799,22 @@ ${component_stack}
                 reset(select_5);
                 var select_5_value;
                 init_select(select_5);
-                reset(div_96);
-                var node_24 = sibling(div_96, 2);
+                reset(div_101);
+                var node_25 = sibling(div_101, 2);
                 {
-                  var consequent_21 = ($$anchor5) => {
-                    var div_97 = root_41();
-                    var input_40 = child(div_97);
-                    remove_input_defaults(input_40);
-                    next(2);
-                    reset(div_97);
-                    template_effect(() => set_value(input_40, (get2(editConstraint), untrack(() => get2(editConstraint).landingRadius ?? 8))));
-                    event("input", input_40, (e) => updateEditField("landingRadius", e.currentTarget.value));
-                    append($$anchor5, div_97);
-                  };
                   var consequent_22 = ($$anchor5) => {
-                    var div_98 = root_42();
-                    var div_99 = child(div_98);
-                    var input_41 = sibling(child(div_99), 2);
-                    remove_input_defaults(input_41);
-                    reset(div_99);
-                    var div_100 = sibling(div_99, 2);
-                    var input_42 = sibling(child(div_100), 2);
-                    remove_input_defaults(input_42);
-                    reset(div_100);
-                    reset(div_98);
-                    template_effect(() => {
-                      set_value(input_41, (get2(editConstraint), untrack(() => get2(editConstraint).landingRadius ?? 8)));
-                      set_value(input_42, (get2(editConstraint), untrack(() => get2(editConstraint).landingHeight ?? 6)));
-                    });
-                    event("input", input_41, (e) => updateEditField("landingRadius", e.currentTarget.value));
-                    event("input", input_42, (e) => updateEditField("landingHeight", e.currentTarget.value));
-                    append($$anchor5, div_98);
-                  };
-                  var alternate_8 = ($$anchor5) => {
-                    var fragment_10 = root_43();
-                    var div_101 = first_child(fragment_10);
-                    var button_21 = child(div_101);
-                    reset(div_101);
-                    var div_102 = sibling(div_101, 2);
-                    var div_103 = child(div_102);
-                    var input_43 = sibling(child(div_103), 2);
+                    var div_102 = root_43();
+                    var input_43 = child(div_102);
                     remove_input_defaults(input_43);
-                    reset(div_103);
-                    var div_104 = sibling(div_103, 2);
+                    next(2);
+                    reset(div_102);
+                    template_effect(() => set_value(input_43, (get2(editConstraint), untrack(() => get2(editConstraint).landingRadius ?? 8))));
+                    event("input", input_43, (e) => updateEditField("landingRadius", e.currentTarget.value));
+                    append($$anchor5, div_102);
+                  };
+                  var consequent_23 = ($$anchor5) => {
+                    var div_103 = root_44();
+                    var div_104 = child(div_103);
                     var input_44 = sibling(child(div_104), 2);
                     remove_input_defaults(input_44);
                     reset(div_104);
@@ -24663,138 +24822,165 @@ ${component_stack}
                     var input_45 = sibling(child(div_105), 2);
                     remove_input_defaults(input_45);
                     reset(div_105);
-                    reset(div_102);
+                    reset(div_103);
                     template_effect(() => {
-                      set_value(input_43, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeX ?? 8)));
-                      set_value(input_44, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeY ?? 8)));
-                      set_value(input_45, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeZ ?? 8)));
+                      set_value(input_44, (get2(editConstraint), untrack(() => get2(editConstraint).landingRadius ?? 8)));
+                      set_value(input_45, (get2(editConstraint), untrack(() => get2(editConstraint).landingHeight ?? 6)));
                     });
-                    event("click", button_21, () => beginRaycastPlacement("landingSize"));
-                    event("input", input_43, (e) => updateEditField("landingSizeX", e.currentTarget.value));
-                    event("input", input_44, (e) => updateEditField("landingSizeY", e.currentTarget.value));
-                    event("input", input_45, (e) => updateEditField("landingSizeZ", e.currentTarget.value));
-                    append($$anchor5, fragment_10);
+                    event("input", input_44, (e) => updateEditField("landingRadius", e.currentTarget.value));
+                    event("input", input_45, (e) => updateEditField("landingHeight", e.currentTarget.value));
+                    append($$anchor5, div_103);
                   };
-                  if_block(node_24, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "sphere" || (get2(editConstraint).landingHitboxType || "sphere") === "circle")) $$render(consequent_21);
-                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "cylinder")) $$render(consequent_22, 1);
-                    else $$render(alternate_8, -1);
+                  var alternate_9 = ($$anchor5) => {
+                    var fragment_12 = root_45();
+                    var div_106 = first_child(fragment_12);
+                    var button_22 = child(div_106);
+                    reset(div_106);
+                    var div_107 = sibling(div_106, 2);
+                    var div_108 = child(div_107);
+                    var input_46 = sibling(child(div_108), 2);
+                    remove_input_defaults(input_46);
+                    reset(div_108);
+                    var div_109 = sibling(div_108, 2);
+                    var input_47 = sibling(child(div_109), 2);
+                    remove_input_defaults(input_47);
+                    reset(div_109);
+                    var div_110 = sibling(div_109, 2);
+                    var input_48 = sibling(child(div_110), 2);
+                    remove_input_defaults(input_48);
+                    reset(div_110);
+                    reset(div_107);
+                    template_effect(() => {
+                      set_value(input_46, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeX ?? 8)));
+                      set_value(input_47, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeY ?? 8)));
+                      set_value(input_48, (get2(editConstraint), untrack(() => get2(editConstraint).landingSizeZ ?? 8)));
+                    });
+                    event("click", button_22, () => beginRaycastPlacement("landingSize"));
+                    event("input", input_46, (e) => updateEditField("landingSizeX", e.currentTarget.value));
+                    event("input", input_47, (e) => updateEditField("landingSizeY", e.currentTarget.value));
+                    event("input", input_48, (e) => updateEditField("landingSizeZ", e.currentTarget.value));
+                    append($$anchor5, fragment_12);
+                  };
+                  if_block(node_25, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "sphere" || (get2(editConstraint).landingHitboxType || "sphere") === "circle")) $$render(consequent_22);
+                    else if (get2(editConstraint), untrack(() => (get2(editConstraint).landingHitboxType || "sphere") === "cylinder")) $$render(consequent_23, 1);
+                    else $$render(alternate_9, -1);
                   });
                 }
-                reset(div_89);
+                reset(div_94);
                 template_effect(() => {
-                  set_value(input_25, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffCx ?? 0)));
-                  set_value(input_26, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffCy ?? 0)));
-                  set_value(input_27, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffCz ?? 0)));
+                  set_value(input_28, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffCx ?? 0)));
+                  set_value(input_29, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffCy ?? 0)));
+                  set_value(input_30, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffCz ?? 0)));
                   if (select_4_value !== (select_4_value = (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHitboxType || "sphere")))) {
                     select_4.value = (select_4.__value = (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHitboxType || "sphere"))) ?? "", select_option(select_4, (get2(editConstraint), untrack(() => get2(editConstraint).takeoffHitboxType || "sphere")));
                   }
-                  classes_6 = set_class(button_18, 1, "btn btn-xs svelte-1nhql4u", null, classes_6, {
+                  classes_6 = set_class(button_19, 1, "btn btn-xs svelte-1nhql4u", null, classes_6, {
                     "btn-accent": !(get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample"),
                     "btn-armed": get2(state2).placementArmed && get2(state2).placementTarget === "takeoffSample"
                   });
-                  set_value(input_37, (get2(editConstraint), untrack(() => get2(editConstraint).landingCx ?? 0)));
-                  set_value(input_38, (get2(editConstraint), untrack(() => get2(editConstraint).landingCy ?? 0)));
-                  set_value(input_39, (get2(editConstraint), untrack(() => get2(editConstraint).landingCz ?? 0)));
+                  set_value(input_40, (get2(editConstraint), untrack(() => get2(editConstraint).landingCx ?? 0)));
+                  set_value(input_41, (get2(editConstraint), untrack(() => get2(editConstraint).landingCy ?? 0)));
+                  set_value(input_42, (get2(editConstraint), untrack(() => get2(editConstraint).landingCz ?? 0)));
                   if (select_5_value !== (select_5_value = (get2(editConstraint), untrack(() => get2(editConstraint).landingHitboxType || "sphere")))) {
                     select_5.value = (select_5.__value = (get2(editConstraint), untrack(() => get2(editConstraint).landingHitboxType || "sphere"))) ?? "", select_option(select_5, (get2(editConstraint), untrack(() => get2(editConstraint).landingHitboxType || "sphere")));
                   }
                 });
-                event("click", button_16, () => beginRaycastPlacement("takeoff"));
-                event("input", input_25, (e) => updateEditField("takeoffCx", e.currentTarget.value));
-                event("input", input_26, (e) => updateEditField("takeoffCy", e.currentTarget.value));
-                event("input", input_27, (e) => updateEditField("takeoffCz", e.currentTarget.value));
+                event("click", button_17, () => beginRaycastPlacement("takeoff"));
+                event("input", input_28, (e) => updateEditField("takeoffCx", e.currentTarget.value));
+                event("input", input_29, (e) => updateEditField("takeoffCy", e.currentTarget.value));
+                event("input", input_30, (e) => updateEditField("takeoffCz", e.currentTarget.value));
                 event("change", select_4, (e) => updateEditField("takeoffHitboxType", e.currentTarget.value));
-                event("click", button_18, () => beginRaycastPlacement("takeoffSample"));
-                event("click", button_20, () => beginRaycastPlacement("landing"));
-                event("input", input_37, (e) => updateEditField("landingCx", e.currentTarget.value));
-                event("input", input_38, (e) => updateEditField("landingCy", e.currentTarget.value));
-                event("input", input_39, (e) => updateEditField("landingCz", e.currentTarget.value));
+                event("click", button_19, () => beginRaycastPlacement("takeoffSample"));
+                event("click", button_21, () => beginRaycastPlacement("landing"));
+                event("input", input_40, (e) => updateEditField("landingCx", e.currentTarget.value));
+                event("input", input_41, (e) => updateEditField("landingCy", e.currentTarget.value));
+                event("input", input_42, (e) => updateEditField("landingCz", e.currentTarget.value));
                 event("change", select_5, (e) => updateEditField("landingHitboxType", e.currentTarget.value));
-                append($$anchor4, fragment_7);
+                append($$anchor4, fragment_9);
               };
-              if_block(node_19, ($$render) => {
-                if (get2(usesJumpArc)) $$render(consequent_23);
+              if_block(node_20, ($$render) => {
+                if (get2(usesJumpArc)) $$render(consequent_24);
               });
             }
-            var node_25 = sibling(node_19, 2);
+            var node_26 = sibling(node_20, 2);
             {
-              var consequent_30 = ($$anchor4) => {
-                var div_106 = root_44();
-                var div_107 = child(div_106);
-                var div_108 = child(div_107);
-                var text_24 = child(div_108);
-                reset(div_108);
-                var div_109 = sibling(div_108, 2);
-                var button_22 = child(div_109);
-                reset(div_109);
-                reset(div_107);
-                var node_26 = sibling(div_107, 2);
+              var consequent_31 = ($$anchor4) => {
+                var div_111 = root_46();
+                var div_112 = child(div_111);
+                var div_113 = child(div_112);
+                var text_24 = child(div_113);
+                reset(div_113);
+                var div_114 = sibling(div_113, 2);
+                var button_23 = child(div_114);
+                reset(div_114);
+                reset(div_112);
+                var node_27 = sibling(div_112, 2);
                 {
-                  var consequent_24 = ($$anchor5) => {
-                    var div_110 = root_45();
-                    append($$anchor5, div_110);
+                  var consequent_25 = ($$anchor5) => {
+                    var div_115 = root_47();
+                    append($$anchor5, div_115);
                   };
-                  if_block(node_26, ($$render) => {
-                    if (get2(editConstraint), untrack(() => (get2(editConstraint).nodes?.length ?? 0) === 0)) $$render(consequent_24);
+                  if_block(node_27, ($$render) => {
+                    if (get2(editConstraint), untrack(() => (get2(editConstraint).nodes?.length ?? 0) === 0)) $$render(consequent_25);
                   });
                 }
-                var node_27 = sibling(node_26, 2);
+                var node_28 = sibling(node_27, 2);
                 each(
-                  node_27,
+                  node_28,
                   1,
                   () => (get2(editConstraint), untrack(() => get2(editConstraint).nodes ?? [])),
                   index,
                   ($$anchor5, node, i) => {
-                    var fragment_11 = root_46();
-                    var div_111 = first_child(fragment_11);
-                    var div_112 = child(div_111);
-                    var div_113 = child(div_112);
-                    var node_28 = child(div_113);
+                    var fragment_13 = root_48();
+                    var div_116 = first_child(fragment_13);
+                    var div_117 = child(div_116);
+                    var div_118 = child(div_117);
+                    var node_29 = child(div_118);
                     {
-                      var consequent_25 = ($$anchor6) => {
+                      var consequent_26 = ($$anchor6) => {
                         var text_25 = text("\u25CB Node 1 \u2014 Start");
                         append($$anchor6, text_25);
                       };
-                      var consequent_26 = ($$anchor6) => {
+                      var consequent_27 = ($$anchor6) => {
                         var text_26 = text();
                         text_26.nodeValue = `\u25CF Node ${i + 1} \u2014 End`;
                         append($$anchor6, text_26);
                       };
-                      var alternate_9 = ($$anchor6) => {
+                      var alternate_10 = ($$anchor6) => {
                         var text_27 = text();
                         text_27.nodeValue = `\u26D3 Node ${i + 1} \u2014 Arc ${i}\u2192${i + 1}`;
                         append($$anchor6, text_27);
                       };
-                      if_block(node_28, ($$render) => {
-                        if (i === 0) $$render(consequent_25);
-                        else if (i, get2(editConstraint), untrack(() => i === get2(editConstraint).nodes.length - 1)) $$render(consequent_26, 1);
-                        else $$render(alternate_9, -1);
+                      if_block(node_29, ($$render) => {
+                        if (i === 0) $$render(consequent_26);
+                        else if (i, get2(editConstraint), untrack(() => i === get2(editConstraint).nodes.length - 1)) $$render(consequent_27, 1);
+                        else $$render(alternate_10, -1);
                       });
                     }
-                    reset(div_113);
-                    var div_114 = sibling(div_113, 2);
-                    var button_23 = child(div_114);
-                    reset(div_114);
-                    reset(div_112);
-                    var div_115 = sibling(div_112, 2);
-                    var div_116 = child(div_115);
-                    var input_46 = sibling(child(div_116), 2);
-                    remove_input_defaults(input_46);
-                    reset(div_116);
-                    var div_117 = sibling(div_116, 2);
-                    var input_47 = sibling(child(div_117), 2);
-                    remove_input_defaults(input_47);
-                    reset(div_117);
-                    var div_118 = sibling(div_117, 2);
-                    var input_48 = sibling(child(div_118), 2);
-                    remove_input_defaults(input_48);
                     reset(div_118);
-                    reset(div_115);
-                    var div_119 = sibling(div_115, 2);
-                    var select_6 = child(div_119);
+                    var div_119 = sibling(div_118, 2);
+                    var button_24 = child(div_119);
+                    reset(div_119);
+                    reset(div_117);
+                    var div_120 = sibling(div_117, 2);
+                    var div_121 = child(div_120);
+                    var input_49 = sibling(child(div_121), 2);
+                    remove_input_defaults(input_49);
+                    reset(div_121);
+                    var div_122 = sibling(div_121, 2);
+                    var input_50 = sibling(child(div_122), 2);
+                    remove_input_defaults(input_50);
+                    reset(div_122);
+                    var div_123 = sibling(div_122, 2);
+                    var input_51 = sibling(child(div_123), 2);
+                    remove_input_defaults(input_51);
+                    reset(div_123);
+                    reset(div_120);
+                    var div_124 = sibling(div_120, 2);
+                    var select_6 = child(div_124);
                     each(select_6, 5, () => HITBOX_TYPES, index, ($$anchor6, shape) => {
-                      var option_6 = root_50();
+                      var option_6 = root_52();
                       var text_28 = child(option_6, true);
                       reset(option_6);
                       var option_6_value = {};
@@ -24809,176 +24995,145 @@ ${component_stack}
                     reset(select_6);
                     var select_6_value;
                     init_select(select_6);
-                    reset(div_119);
-                    var node_29 = sibling(div_119, 2);
+                    reset(div_124);
+                    var node_30 = sibling(div_124, 2);
                     {
-                      var consequent_27 = ($$anchor6) => {
-                        var div_120 = root_51();
-                        var input_49 = child(div_120);
-                        remove_input_defaults(input_49);
-                        next(2);
-                        reset(div_120);
-                        template_effect(() => set_value(input_49, (get2(node), untrack(() => get2(node).radius ?? 8))));
-                        event("input", input_49, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { radius: Number(e.currentTarget.value) }));
-                        append($$anchor6, div_120);
-                      };
                       var consequent_28 = ($$anchor6) => {
-                        var div_121 = root_52();
-                        var div_122 = child(div_121);
-                        var input_50 = sibling(child(div_122), 2);
-                        remove_input_defaults(input_50);
-                        reset(div_122);
-                        var div_123 = sibling(div_122, 2);
-                        var input_51 = sibling(child(div_123), 2);
-                        remove_input_defaults(input_51);
-                        reset(div_123);
-                        reset(div_121);
-                        template_effect(() => {
-                          set_value(input_50, (get2(node), untrack(() => get2(node).radius ?? 8)));
-                          set_value(input_51, (get2(node), untrack(() => get2(node).height ?? 6)));
-                        });
-                        event("input", input_50, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { radius: Number(e.currentTarget.value) }));
-                        event("input", input_51, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { height: Number(e.currentTarget.value) }));
-                        append($$anchor6, div_121);
-                      };
-                      var alternate_10 = ($$anchor6) => {
-                        var div_124 = root_53();
-                        var div_125 = child(div_124);
-                        var input_52 = sibling(child(div_125), 2);
+                        var div_125 = root_53();
+                        var input_52 = child(div_125);
                         remove_input_defaults(input_52);
+                        next(2);
                         reset(div_125);
-                        var div_126 = sibling(div_125, 2);
-                        var input_53 = sibling(child(div_126), 2);
-                        remove_input_defaults(input_53);
-                        reset(div_126);
-                        var div_127 = sibling(div_126, 2);
-                        var input_54 = sibling(child(div_127), 2);
-                        remove_input_defaults(input_54);
-                        reset(div_127);
-                        reset(div_124);
-                        template_effect(() => {
-                          set_value(input_52, (get2(node), untrack(() => get2(node).sizeX ?? 8)));
-                          set_value(input_53, (get2(node), untrack(() => get2(node).sizeY ?? 8)));
-                          set_value(input_54, (get2(node), untrack(() => get2(node).sizeZ ?? 8)));
-                        });
-                        event("input", input_52, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeX: Number(e.currentTarget.value) }));
-                        event("input", input_53, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeY: Number(e.currentTarget.value) }));
-                        event("input", input_54, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeZ: Number(e.currentTarget.value) }));
-                        append($$anchor6, div_124);
+                        template_effect(() => set_value(input_52, (get2(node), untrack(() => get2(node).radius ?? 8))));
+                        event("input", input_52, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { radius: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_125);
                       };
-                      if_block(node_29, ($$render) => {
-                        if (get2(node), untrack(() => (get2(node).hitboxType || "sphere") === "sphere" || (get2(node).hitboxType || "sphere") === "circle")) $$render(consequent_27);
-                        else if (get2(node), untrack(() => (get2(node).hitboxType || "sphere") === "cylinder")) $$render(consequent_28, 1);
-                        else $$render(alternate_10, -1);
-                      });
-                    }
-                    reset(div_111);
-                    var node_30 = sibling(div_111, 2);
-                    {
                       var consequent_29 = ($$anchor6) => {
-                        var div_128 = root_54();
-                        var span_16 = child(div_128);
-                        span_16.textContent = `Arc ${i + 1} jump y-vel`;
-                        var input_55 = sibling(span_16, 2);
-                        remove_input_defaults(input_55);
+                        var div_126 = root_54();
+                        var div_127 = child(div_126);
+                        var input_53 = sibling(child(div_127), 2);
+                        remove_input_defaults(input_53);
+                        reset(div_127);
+                        var div_128 = sibling(div_127, 2);
+                        var input_54 = sibling(child(div_128), 2);
+                        remove_input_defaults(input_54);
                         reset(div_128);
-                        template_effect(() => set_value(input_55, (get2(editConstraint), i, untrack(() => get2(editConstraint).arcParams[i]?.jumpYVel ?? 0.072))));
-                        event("input", input_55, (e) => store().updateTrainArcParams(get2(trainEditorTargetId), i, { jumpYVel: Number(e.currentTarget.value) }));
-                        append($$anchor6, div_128);
+                        reset(div_126);
+                        template_effect(() => {
+                          set_value(input_53, (get2(node), untrack(() => get2(node).radius ?? 8)));
+                          set_value(input_54, (get2(node), untrack(() => get2(node).height ?? 6)));
+                        });
+                        event("input", input_53, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { radius: Number(e.currentTarget.value) }));
+                        event("input", input_54, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { height: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_126);
+                      };
+                      var alternate_11 = ($$anchor6) => {
+                        var div_129 = root_55();
+                        var div_130 = child(div_129);
+                        var input_55 = sibling(child(div_130), 2);
+                        remove_input_defaults(input_55);
+                        reset(div_130);
+                        var div_131 = sibling(div_130, 2);
+                        var input_56 = sibling(child(div_131), 2);
+                        remove_input_defaults(input_56);
+                        reset(div_131);
+                        var div_132 = sibling(div_131, 2);
+                        var input_57 = sibling(child(div_132), 2);
+                        remove_input_defaults(input_57);
+                        reset(div_132);
+                        reset(div_129);
+                        template_effect(() => {
+                          set_value(input_55, (get2(node), untrack(() => get2(node).sizeX ?? 8)));
+                          set_value(input_56, (get2(node), untrack(() => get2(node).sizeY ?? 8)));
+                          set_value(input_57, (get2(node), untrack(() => get2(node).sizeZ ?? 8)));
+                        });
+                        event("input", input_55, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeX: Number(e.currentTarget.value) }));
+                        event("input", input_56, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeY: Number(e.currentTarget.value) }));
+                        event("input", input_57, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { sizeZ: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_129);
                       };
                       if_block(node_30, ($$render) => {
-                        if (i, get2(editConstraint), untrack(() => i < (get2(editConstraint).arcParams?.length ?? 0))) $$render(consequent_29);
+                        if (get2(node), untrack(() => (get2(node).hitboxType || "sphere") === "sphere" || (get2(node).hitboxType || "sphere") === "circle")) $$render(consequent_28);
+                        else if (get2(node), untrack(() => (get2(node).hitboxType || "sphere") === "cylinder")) $$render(consequent_29, 1);
+                        else $$render(alternate_11, -1);
+                      });
+                    }
+                    reset(div_116);
+                    var node_31 = sibling(div_116, 2);
+                    {
+                      var consequent_30 = ($$anchor6) => {
+                        var div_133 = root_56();
+                        var span_16 = child(div_133);
+                        span_16.textContent = `Arc ${i + 1} jump y-vel`;
+                        var input_58 = sibling(span_16, 2);
+                        remove_input_defaults(input_58);
+                        reset(div_133);
+                        template_effect(() => set_value(input_58, (get2(editConstraint), i, untrack(() => get2(editConstraint).arcParams[i]?.jumpYVel ?? 0.072))));
+                        event("input", input_58, (e) => store().updateTrainArcParams(get2(trainEditorTargetId), i, { jumpYVel: Number(e.currentTarget.value) }));
+                        append($$anchor6, div_133);
+                      };
+                      if_block(node_31, ($$render) => {
+                        if (i, get2(editConstraint), untrack(() => i < (get2(editConstraint).arcParams?.length ?? 0))) $$render(consequent_30);
                       });
                     }
                     template_effect(() => {
-                      set_value(input_46, (get2(node), untrack(() => get2(node).cx ?? 0)));
-                      set_value(input_47, (get2(node), untrack(() => get2(node).cy ?? 0)));
-                      set_value(input_48, (get2(node), untrack(() => get2(node).cz ?? 0)));
+                      set_value(input_49, (get2(node), untrack(() => get2(node).cx ?? 0)));
+                      set_value(input_50, (get2(node), untrack(() => get2(node).cy ?? 0)));
+                      set_value(input_51, (get2(node), untrack(() => get2(node).cz ?? 0)));
                       if (select_6_value !== (select_6_value = (get2(node), untrack(() => get2(node).hitboxType || "sphere")))) {
                         select_6.value = (select_6.__value = (get2(node), untrack(() => get2(node).hitboxType || "sphere"))) ?? "", select_option(select_6, (get2(node), untrack(() => get2(node).hitboxType || "sphere")));
                       }
                     });
-                    event("click", button_23, () => store().removeTrainNode(get2(trainEditorTargetId), i));
-                    event("input", input_46, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cx: Number(e.currentTarget.value) }));
-                    event("input", input_47, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cy: Number(e.currentTarget.value) }));
-                    event("input", input_48, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cz: Number(e.currentTarget.value) }));
+                    event("click", button_24, () => store().removeTrainNode(get2(trainEditorTargetId), i));
+                    event("input", input_49, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cx: Number(e.currentTarget.value) }));
+                    event("input", input_50, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cy: Number(e.currentTarget.value) }));
+                    event("input", input_51, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { cz: Number(e.currentTarget.value) }));
                     event("change", select_6, (e) => store().updateTrainNode(get2(trainEditorTargetId), i, { hitboxType: e.currentTarget.value }));
-                    append($$anchor5, fragment_11);
+                    append($$anchor5, fragment_13);
                   }
                 );
-                reset(div_106);
+                reset(div_111);
                 template_effect(() => set_text(text_24, `Jump Train \u2014 ${(get2(editConstraint), untrack(() => get2(editConstraint).nodes?.length ?? 0)) ?? ""} node${(get2(editConstraint), untrack(() => (get2(editConstraint).nodes?.length ?? 0) === 1 ? "" : "s")) ?? ""}, ${(get2(editConstraint), untrack(() => get2(editConstraint).arcParams?.length ?? 0)) ?? ""} arc${(get2(editConstraint), untrack(() => (get2(editConstraint).arcParams?.length ?? 0) === 1 ? "" : "s")) ?? ""}`));
-                event("click", button_22, () => beginRaycastPlacement("trainNode"));
-                append($$anchor4, div_106);
+                event("click", button_23, () => beginRaycastPlacement("trainNode"));
+                append($$anchor4, div_111);
               };
-              if_block(node_25, ($$render) => {
-                if (get2(usesJumpTrain)) $$render(consequent_30);
+              if_block(node_26, ($$render) => {
+                if (get2(usesJumpTrain)) $$render(consequent_31);
               });
             }
-            var node_31 = sibling(node_25, 2);
-            {
-              var consequent_31 = ($$anchor4) => {
-                var div_129 = root_55();
-                var div_130 = sibling(child(div_129), 2);
-                var div_131 = child(div_130);
-                var input_56 = sibling(child(div_131), 2);
-                remove_input_defaults(input_56);
-                reset(div_131);
-                var div_132 = sibling(div_131, 2);
-                var input_57 = sibling(child(div_132), 2);
-                remove_input_defaults(input_57);
-                reset(div_132);
-                reset(div_130);
-                reset(div_129);
-                template_effect(() => {
-                  set_value(input_56, (get2(editConstraint), untrack(() => get2(editConstraint).yaw ?? 0)));
-                  set_value(input_57, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
-                });
-                event("input", input_56, (e) => updateEditField("yaw", e.currentTarget.value));
-                event("input", input_57, (e) => updateEditField("toleranceRad", e.currentTarget.value));
-                append($$anchor4, div_129);
-              };
-              if_block(node_31, ($$render) => {
-                if (get2(showLookDirection)) $$render(consequent_31);
-              });
-            }
-            var node_32 = sibling(node_31, 2);
+            var node_32 = sibling(node_26, 2);
             {
               var consequent_32 = ($$anchor4) => {
-                var div_133 = root_56();
-                var div_134 = sibling(child(div_133), 2);
-                var div_135 = child(div_134);
-                var input_58 = sibling(child(div_135), 2);
-                remove_input_defaults(input_58);
-                reset(div_135);
-                var div_136 = sibling(div_135, 2);
+                var div_134 = root_57();
+                var div_135 = sibling(child(div_134), 2);
+                var div_136 = child(div_135);
                 var input_59 = sibling(child(div_136), 2);
                 remove_input_defaults(input_59);
                 reset(div_136);
+                var div_137 = sibling(div_136, 2);
+                var input_60 = sibling(child(div_137), 2);
+                remove_input_defaults(input_60);
+                reset(div_137);
+                reset(div_135);
                 reset(div_134);
-                reset(div_133);
                 template_effect(() => {
-                  set_value(input_58, (get2(editConstraint), untrack(() => get2(editConstraint).yawMin ?? -0.6)));
-                  set_value(input_59, (get2(editConstraint), untrack(() => get2(editConstraint).yawMax ?? 0.6)));
+                  set_value(input_59, (get2(editConstraint), untrack(() => get2(editConstraint).yaw ?? 0)));
+                  set_value(input_60, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
                 });
-                event("input", input_58, (e) => updateEditField("yawMin", e.currentTarget.value));
-                event("input", input_59, (e) => updateEditField("yawMax", e.currentTarget.value));
-                append($$anchor4, div_133);
+                event("input", input_59, (e) => updateEditField("yaw", e.currentTarget.value));
+                event("input", input_60, (e) => updateEditField("toleranceRad", e.currentTarget.value));
+                append($$anchor4, div_134);
               };
               if_block(node_32, ($$render) => {
-                if (get2(showLookRange)) $$render(consequent_32);
+                if (get2(showLookDirection)) $$render(consequent_32);
               });
             }
             var node_33 = sibling(node_32, 2);
             {
               var consequent_33 = ($$anchor4) => {
-                var div_137 = root_57();
-                var div_138 = sibling(child(div_137), 2);
-                var div_139 = child(div_138);
-                var input_60 = sibling(child(div_139), 2);
-                remove_input_defaults(input_60);
-                reset(div_139);
-                var div_140 = sibling(div_139, 2);
+                var div_138 = root_58();
+                var div_139 = sibling(child(div_138), 2);
+                var div_140 = child(div_139);
                 var input_61 = sibling(child(div_140), 2);
                 remove_input_defaults(input_61);
                 reset(div_140);
@@ -24986,26 +25141,24 @@ ${component_stack}
                 var input_62 = sibling(child(div_141), 2);
                 remove_input_defaults(input_62);
                 reset(div_141);
+                reset(div_139);
                 reset(div_138);
-                reset(div_137);
                 template_effect(() => {
-                  set_value(input_60, (get2(editConstraint), untrack(() => get2(editConstraint).targetYaw ?? 0)));
-                  set_value(input_61, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
-                  set_value(input_62, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
+                  set_value(input_61, (get2(editConstraint), untrack(() => get2(editConstraint).yawMin ?? -0.6)));
+                  set_value(input_62, (get2(editConstraint), untrack(() => get2(editConstraint).yawMax ?? 0.6)));
                 });
-                event("input", input_60, (e) => updateEditField("targetYaw", e.currentTarget.value));
-                event("input", input_61, (e) => updateEditField("toleranceRad", e.currentTarget.value));
-                event("input", input_62, (e) => updateEditField("minSpeed", e.currentTarget.value));
-                append($$anchor4, div_137);
+                event("input", input_61, (e) => updateEditField("yawMin", e.currentTarget.value));
+                event("input", input_62, (e) => updateEditField("yawMax", e.currentTarget.value));
+                append($$anchor4, div_138);
               };
               if_block(node_33, ($$render) => {
-                if (get2(showVelocityDirection)) $$render(consequent_33);
+                if (get2(showLookRange)) $$render(consequent_33);
               });
             }
             var node_34 = sibling(node_33, 2);
             {
               var consequent_34 = ($$anchor4) => {
-                var div_142 = root_58();
+                var div_142 = root_59();
                 var div_143 = sibling(child(div_142), 2);
                 var div_144 = child(div_143);
                 var input_63 = sibling(child(div_144), 2);
@@ -25015,45 +25168,98 @@ ${component_stack}
                 var input_64 = sibling(child(div_145), 2);
                 remove_input_defaults(input_64);
                 reset(div_145);
+                var div_146 = sibling(div_145, 2);
+                var input_65 = sibling(child(div_146), 2);
+                remove_input_defaults(input_65);
+                reset(div_146);
                 reset(div_143);
                 reset(div_142);
                 template_effect(() => {
-                  set_value(input_63, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
-                  set_value(input_64, (get2(editConstraint), untrack(() => get2(editConstraint).maxSpeed ?? 0.02)));
+                  set_value(input_63, (get2(editConstraint), untrack(() => get2(editConstraint).targetYaw ?? 0)));
+                  set_value(input_64, (get2(editConstraint), untrack(() => get2(editConstraint).toleranceRad ?? 0.35)));
+                  set_value(input_65, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
                 });
-                event("input", input_63, (e) => updateEditField("minSpeed", e.currentTarget.value));
-                event("input", input_64, (e) => updateEditField("maxSpeed", e.currentTarget.value));
+                event("input", input_63, (e) => updateEditField("targetYaw", e.currentTarget.value));
+                event("input", input_64, (e) => updateEditField("toleranceRad", e.currentTarget.value));
+                event("input", input_65, (e) => updateEditField("minSpeed", e.currentTarget.value));
                 append($$anchor4, div_142);
               };
               if_block(node_34, ($$render) => {
-                if (get2(showSpeedWindow)) $$render(consequent_34);
+                if (get2(showVelocityDirection)) $$render(consequent_34);
               });
             }
             var node_35 = sibling(node_34, 2);
             {
               var consequent_35 = ($$anchor4) => {
-                var div_146 = root_59();
-                var div_147 = sibling(child(div_146), 2);
-                var input_65 = child(div_147);
-                remove_input_defaults(input_65);
-                next(2);
+                var div_147 = root_60();
+                var div_148 = sibling(child(div_147), 2);
+                var div_149 = child(div_148);
+                var input_66 = sibling(child(div_149), 2);
+                remove_input_defaults(input_66);
+                reset(div_149);
+                var div_150 = sibling(div_149, 2);
+                var input_67 = sibling(child(div_150), 2);
+                remove_input_defaults(input_67);
+                reset(div_150);
+                reset(div_148);
                 reset(div_147);
-                reset(div_146);
-                template_effect(() => set_value(input_65, (get2(editConstraint), untrack(() => get2(editConstraint).maxDeltaRad ?? 0.5))));
-                event("input", input_65, (e) => updateEditField("maxDeltaRad", e.currentTarget.value));
-                append($$anchor4, div_146);
+                template_effect(() => {
+                  set_value(input_66, (get2(editConstraint), untrack(() => get2(editConstraint).minSpeed ?? 0)));
+                  set_value(input_67, (get2(editConstraint), untrack(() => get2(editConstraint).maxSpeed ?? 0.02)));
+                });
+                event("input", input_66, (e) => updateEditField("minSpeed", e.currentTarget.value));
+                event("input", input_67, (e) => updateEditField("maxSpeed", e.currentTarget.value));
+                append($$anchor4, div_147);
               };
               if_block(node_35, ($$render) => {
-                if (get2(showTurn)) $$render(consequent_35);
+                if (get2(showSpeedWindow)) $$render(consequent_35);
               });
             }
             var node_36 = sibling(node_35, 2);
             {
               var consequent_36 = ($$anchor4) => {
-                var div_148 = root_60();
-                var select_7 = sibling(child(div_148), 2);
+                var div_151 = root_61();
+                var div_152 = sibling(child(div_151), 2);
+                var input_68 = child(div_152);
+                remove_input_defaults(input_68);
+                next(2);
+                reset(div_152);
+                reset(div_151);
+                template_effect(($0) => set_value(input_68, $0), [
+                  () => (get2(editConstraint), untrack(() => speedToDisplay(get2(editConstraint).unlockSpeed, 0.02)))
+                ]);
+                event("input", input_68, (e) => updateEditField("unlockSpeed", displayToSpeed(e.currentTarget.value, 0.02)));
+                append($$anchor4, div_151);
+              };
+              if_block(node_36, ($$render) => {
+                if (get2(showSpeedLockedBox)) $$render(consequent_36);
+              });
+            }
+            var node_37 = sibling(node_36, 2);
+            {
+              var consequent_37 = ($$anchor4) => {
+                var div_153 = root_62();
+                var div_154 = sibling(child(div_153), 2);
+                var input_69 = child(div_154);
+                remove_input_defaults(input_69);
+                next(2);
+                reset(div_154);
+                reset(div_153);
+                template_effect(() => set_value(input_69, (get2(editConstraint), untrack(() => get2(editConstraint).maxDeltaRad ?? 0.5))));
+                event("input", input_69, (e) => updateEditField("maxDeltaRad", e.currentTarget.value));
+                append($$anchor4, div_153);
+              };
+              if_block(node_37, ($$render) => {
+                if (get2(showTurn)) $$render(consequent_37);
+              });
+            }
+            var node_38 = sibling(node_37, 2);
+            {
+              var consequent_38 = ($$anchor4) => {
+                var div_155 = root_63();
+                var select_7 = sibling(child(div_155), 2);
                 each(select_7, 5, () => REQUIRED_STATES, index, ($$anchor5, requiredState) => {
-                  var option_7 = root_61();
+                  var option_7 = root_64();
                   var text_29 = child(option_7, true);
                   reset(option_7);
                   var option_7_value = {};
@@ -25068,28 +25274,28 @@ ${component_stack}
                 reset(select_7);
                 var select_7_value;
                 init_select(select_7);
-                reset(div_148);
+                reset(div_155);
                 template_effect(() => {
                   if (select_7_value !== (select_7_value = (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded")))) {
                     select_7.value = (select_7.__value = (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded"))) ?? "", select_option(select_7, (get2(editConstraint), untrack(() => get2(editConstraint).requiredState || "Grounded")));
                   }
                 });
                 event("change", select_7, (e) => updateEditField("requiredState", e.currentTarget.value));
-                append($$anchor4, div_148);
+                append($$anchor4, div_155);
               };
-              if_block(node_36, ($$render) => {
-                if (get2(showState)) $$render(consequent_36);
+              if_block(node_38, ($$render) => {
+                if (get2(showState)) $$render(consequent_38);
               });
             }
-            var button_24 = sibling(node_36, 2);
-            var node_37 = sibling(button_24, 2);
+            var button_25 = sibling(node_38, 2);
+            var node_39 = sibling(button_25, 2);
             {
-              var consequent_37 = ($$anchor4) => {
-                var div_149 = root_62();
-                var span_17 = sibling(child(div_149), 2);
+              var consequent_39 = ($$anchor4) => {
+                var div_156 = root_65();
+                var span_17 = sibling(child(div_156), 2);
                 var text_30 = child(span_17);
                 reset(span_17);
-                reset(div_149);
+                reset(div_156);
                 template_effect(
                   ($0, $1, $2) => set_text(text_30, `${$0 ?? ""},
                                     ${$1 ?? ""},
@@ -25100,27 +25306,27 @@ ${component_stack}
                     () => (get2(state2), untrack(() => fmt(get2(state2).viewportCursor.point.z)))
                   ]
                 );
-                append($$anchor4, div_149);
+                append($$anchor4, div_156);
               };
-              if_block(node_37, ($$render) => {
-                if (get2(state2), untrack(() => get2(state2).viewportCursor)) $$render(consequent_37);
+              if_block(node_39, ($$render) => {
+                if (get2(state2), untrack(() => get2(state2).viewportCursor)) $$render(consequent_39);
               });
             }
-            var div_150 = sibling(node_37, 2);
-            var div_151 = sibling(child(div_150), 2);
-            var button_25 = child(div_151);
-            var button_26 = sibling(button_25, 2);
+            var div_157 = sibling(node_39, 2);
+            var div_158 = sibling(child(div_157), 2);
+            var button_26 = child(div_158);
             var button_27 = sibling(button_26, 2);
             var button_28 = sibling(button_27, 2);
             var button_29 = sibling(button_28, 2);
             var button_30 = sibling(button_29, 2);
-            reset(div_151);
-            reset(div_150);
-            var node_38 = sibling(div_150, 2);
+            var button_31 = sibling(button_30, 2);
+            reset(div_158);
+            reset(div_157);
+            var node_40 = sibling(div_157, 2);
             {
-              var consequent_39 = ($$anchor4) => {
-                var div_152 = root_63();
-                var span_18 = child(div_152);
+              var consequent_41 = ($$anchor4) => {
+                var div_159 = root_66();
+                var span_18 = child(div_159);
                 var b_1 = sibling(child(span_18));
                 var text_31 = child(b_1, true);
                 reset(b_1);
@@ -25140,10 +25346,10 @@ ${component_stack}
                 var text_34 = child(b_4, true);
                 reset(b_4);
                 reset(span_21);
-                var node_39 = sibling(span_21, 2);
+                var node_41 = sibling(span_21, 2);
                 {
-                  var consequent_38 = ($$anchor5) => {
-                    var span_22 = root_64();
+                  var consequent_40 = ($$anchor5) => {
+                    var span_22 = root_67();
                     var b_5 = sibling(child(span_22));
                     var text_35 = child(b_5, true);
                     reset(b_5);
@@ -25153,11 +25359,11 @@ ${component_stack}
                     ]);
                     append($$anchor5, span_22);
                   };
-                  if_block(node_39, ($$render) => {
-                    if (get2(selected), untrack(() => get2(selected).constraint.bx !== void 0)) $$render(consequent_38);
+                  if_block(node_41, ($$render) => {
+                    if (get2(selected), untrack(() => get2(selected).constraint.bx !== void 0)) $$render(consequent_40);
                   });
                 }
-                reset(div_152);
+                reset(div_159);
                 template_effect(
                   ($0, $1, $2, $3) => {
                     set_text(text_31, $0);
@@ -25172,10 +25378,10 @@ ${component_stack}
                     () => (get2(selected), untrack(() => fmt(get2(selected).constraint.radius ?? 8)))
                   ]
                 );
-                append($$anchor4, div_152);
+                append($$anchor4, div_159);
               };
-              if_block(node_38, ($$render) => {
-                if (get2(selected), untrack(() => get2(selected).constraint.cx !== void 0)) $$render(consequent_39);
+              if_block(node_40, ($$render) => {
+                if (get2(selected), untrack(() => get2(selected).constraint.cx !== void 0)) $$render(consequent_41);
               });
             }
             reset(div_12);
@@ -25197,76 +25403,76 @@ ${component_stack}
             event("click", button_9, () => store().duplicateConstraint(get2(selected).id));
             event("click", button_10, () => store().deleteConstraint(get2(selected).id));
             event("input", input_1, (e) => updateEditLabel(e.currentTarget.value));
-            event("click", button_24, applySelected);
-            event("click", button_25, () => nudge(-1, 0, 0));
-            event("click", button_26, () => nudge(1, 0, 0));
-            event("click", button_27, () => nudge(0, -1, 0));
-            event("click", button_28, () => nudge(0, 1, 0));
-            event("click", button_29, () => nudge(0, 0, -1));
-            event("click", button_30, () => nudge(0, 0, 1));
+            event("click", button_25, applySelected);
+            event("click", button_26, () => nudge(-1, 0, 0));
+            event("click", button_27, () => nudge(1, 0, 0));
+            event("click", button_28, () => nudge(0, -1, 0));
+            event("click", button_29, () => nudge(0, 1, 0));
+            event("click", button_30, () => nudge(0, 0, -1));
+            event("click", button_31, () => nudge(0, 0, 1));
             append($$anchor3, div_12);
           };
-          var alternate_11 = ($$anchor3) => {
-            var div_153 = root_65();
-            append($$anchor3, div_153);
+          var alternate_12 = ($$anchor3) => {
+            var div_160 = root_68();
+            append($$anchor3, div_160);
           };
           if_block(node_9, ($$render) => {
-            if (get2(selected)) $$render(consequent_40);
-            else $$render(alternate_11, -1);
+            if (get2(selected)) $$render(consequent_42);
+            else $$render(alternate_12, -1);
           });
         }
         append($$anchor2, fragment_2);
       };
       if_block(node_8, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "edit")) $$render(consequent_41);
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "edit")) $$render(consequent_43);
       });
     }
-    var node_40 = sibling(node_8, 2);
+    var node_42 = sibling(node_8, 2);
     {
-      var consequent_42 = ($$anchor2) => {
-        var div_154 = root_66();
-        var div_155 = sibling(child(div_154), 2);
-        var div_156 = sibling(child(div_155), 2);
-        var label_1 = child(div_156);
-        var input_66 = child(label_1);
-        remove_input_defaults(input_66);
+      var consequent_44 = ($$anchor2) => {
+        var div_161 = root_69();
+        var div_162 = sibling(child(div_161), 2);
+        var div_163 = sibling(child(div_162), 2);
+        var label_1 = child(div_163);
+        var input_70 = child(label_1);
+        remove_input_defaults(input_70);
         next(4);
         reset(label_1);
         var label_2 = sibling(label_1, 2);
-        var input_67 = child(label_2);
-        remove_input_defaults(input_67);
+        var input_71 = child(label_2);
+        remove_input_defaults(input_71);
         next(4);
         reset(label_2);
         var label_3 = sibling(label_2, 2);
-        var input_68 = child(label_3);
-        remove_input_defaults(input_68);
+        var input_72 = child(label_3);
+        remove_input_defaults(input_72);
         next(4);
         reset(label_3);
         var label_4 = sibling(label_3, 2);
-        var input_69 = child(label_4);
-        remove_input_defaults(input_69);
+        var input_73 = child(label_4);
+        remove_input_defaults(input_73);
         next(4);
         reset(label_4);
-        reset(div_156);
-        reset(div_155);
-        var div_157 = sibling(div_155, 2);
-        var div_158 = child(div_157);
-        var text_36 = child(div_158);
-        reset(div_158);
-        var input_70 = sibling(div_158, 2);
-        remove_input_defaults(input_70);
-        reset(div_157);
-        var div_159 = sibling(div_157, 2);
-        var div_160 = child(div_159);
-        var text_37 = child(div_160);
-        reset(div_160);
-        var input_71 = sibling(div_160, 2);
-        remove_input_defaults(input_71);
-        reset(div_159);
-        var div_161 = sibling(div_159, 2);
-        var div_162 = sibling(child(div_161), 2);
+        reset(div_163);
+        reset(div_162);
+        var div_164 = sibling(div_162, 2);
+        var div_165 = child(div_164);
+        var text_36 = child(div_165);
+        reset(div_165);
+        var input_74 = sibling(div_165, 2);
+        remove_input_defaults(input_74);
+        reset(div_164);
+        var div_166 = sibling(div_164, 2);
+        var div_167 = child(div_166);
+        var text_37 = child(div_167);
+        reset(div_167);
+        var input_75 = sibling(div_167, 2);
+        remove_input_defaults(input_75);
+        reset(div_166);
+        var div_168 = sibling(div_166, 2);
+        var div_169 = sibling(child(div_168), 2);
         each(
-          div_162,
+          div_169,
           4,
           () => [
             ["classic", "Classic", "#58a6ff"],
@@ -25279,79 +25485,79 @@ ${component_stack}
             let id = () => get2($$array_1)[0];
             let label = () => get2($$array_1)[1];
             let dot = () => get2($$array_1)[2];
-            var button_31 = root_67();
+            var button_32 = root_70();
             let classes_7;
-            var span_23 = child(button_31);
+            var span_23 = child(button_32);
             var text_38 = sibling(span_23);
-            reset(button_31);
+            reset(button_32);
             template_effect(() => {
-              classes_7 = set_class(button_31, 1, "theme-btn svelte-1nhql4u", null, classes_7, { active: get2(state2).visuals.colorTheme === id() });
+              classes_7 = set_class(button_32, 1, "theme-btn svelte-1nhql4u", null, classes_7, { active: get2(state2).visuals.colorTheme === id() });
               set_style(span_23, `background:${dot() ?? ""}`);
               set_text(text_38, ` ${label() ?? ""}`);
             });
-            event("click", button_31, () => store().setVisuals({ colorTheme: id() }));
-            append($$anchor3, button_31);
+            event("click", button_32, () => store().setVisuals({ colorTheme: id() }));
+            append($$anchor3, button_32);
           }
         );
-        reset(div_162);
+        reset(div_169);
+        reset(div_168);
         reset(div_161);
-        reset(div_154);
         template_effect(
           ($0) => {
-            set_checked(input_66, (get2(state2), untrack(() => get2(state2).visuals.showAll)));
-            set_checked(input_67, (get2(state2), untrack(() => get2(state2).visuals.showOnlySelected)));
-            set_checked(input_68, (get2(state2), untrack(() => get2(state2).visuals.showFlowLines)));
-            set_checked(input_69, (get2(state2), untrack(() => get2(state2).visuals.showLabels)));
+            set_checked(input_70, (get2(state2), untrack(() => get2(state2).visuals.showAll)));
+            set_checked(input_71, (get2(state2), untrack(() => get2(state2).visuals.showOnlySelected)));
+            set_checked(input_72, (get2(state2), untrack(() => get2(state2).visuals.showFlowLines)));
+            set_checked(input_73, (get2(state2), untrack(() => get2(state2).visuals.showLabels)));
             set_text(text_36, `Opacity \u2014 ${$0 ?? ""}%`);
-            set_value(input_70, (get2(state2), untrack(() => get2(state2).visuals.opacity)));
+            set_value(input_74, (get2(state2), untrack(() => get2(state2).visuals.opacity)));
             set_text(text_37, `Line Thickness \u2014 ${(get2(state2), untrack(() => get2(state2).visuals.lineThickness)) ?? ""}px`);
-            set_value(input_71, (get2(state2), untrack(() => get2(state2).visuals.lineThickness)));
+            set_value(input_75, (get2(state2), untrack(() => get2(state2).visuals.lineThickness)));
           },
           [
             () => (get2(state2), untrack(() => Math.round(get2(state2).visuals.opacity * 100)))
           ]
         );
-        event("change", input_66, (e) => store().setVisuals({ showAll: e.currentTarget.checked }));
-        event("change", input_67, (e) => store().setVisuals({ showOnlySelected: e.currentTarget.checked }));
-        event("change", input_68, (e) => store().setVisuals({ showFlowLines: e.currentTarget.checked }));
-        event("change", input_69, (e) => store().setVisuals({ showLabels: e.currentTarget.checked }));
-        event("input", input_70, (e) => store().setVisuals({ opacity: Number(e.currentTarget.value) }));
-        event("input", input_71, (e) => store().setVisuals({ lineThickness: Number(e.currentTarget.value) }));
-        append($$anchor2, div_154);
+        event("change", input_70, (e) => store().setVisuals({ showAll: e.currentTarget.checked }));
+        event("change", input_71, (e) => store().setVisuals({ showOnlySelected: e.currentTarget.checked }));
+        event("change", input_72, (e) => store().setVisuals({ showFlowLines: e.currentTarget.checked }));
+        event("change", input_73, (e) => store().setVisuals({ showLabels: e.currentTarget.checked }));
+        event("input", input_74, (e) => store().setVisuals({ opacity: Number(e.currentTarget.value) }));
+        event("input", input_75, (e) => store().setVisuals({ lineThickness: Number(e.currentTarget.value) }));
+        append($$anchor2, div_161);
       };
-      if_block(node_40, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "visuals")) $$render(consequent_42);
+      if_block(node_42, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "visuals")) $$render(consequent_44);
       });
     }
-    var node_41 = sibling(node_40, 2);
+    var node_43 = sibling(node_42, 2);
     {
-      var consequent_44 = ($$anchor2) => {
-        var div_163 = root_68();
-        var div_164 = sibling(child(div_163), 2);
-        var button_32 = child(div_164);
-        var button_33 = sibling(button_32, 2);
-        reset(div_164);
-        var node_42 = sibling(div_164, 2);
+      var consequent_46 = ($$anchor2) => {
+        var div_170 = root_71();
+        var div_171 = sibling(child(div_170), 2);
+        var button_33 = child(div_171);
+        var button_34 = sibling(button_33, 2);
+        reset(div_171);
+        var node_44 = sibling(div_171, 2);
         {
-          var consequent_43 = ($$anchor3) => {
-            var div_165 = root_69();
-            append($$anchor3, div_165);
+          var consequent_45 = ($$anchor3) => {
+            var div_172 = root_72();
+            append($$anchor3, div_172);
           };
-          var alternate_12 = ($$anchor3) => {
-            var div_166 = root_70();
-            each(div_166, 5, () => (get2(state2), untrack(() => get2(state2).savedPositions)), index, ($$anchor4, pos, idx) => {
-              var div_167 = root_71();
-              var div_168 = child(div_167);
-              var text_39 = child(div_168, true);
-              reset(div_168);
-              var div_169 = sibling(div_168, 2);
-              var text_40 = child(div_169);
-              reset(div_169);
-              var div_170 = sibling(div_169, 2);
-              var button_34 = child(div_170);
-              var button_35 = sibling(button_34, 2);
-              reset(div_170);
-              reset(div_167);
+          var alternate_13 = ($$anchor3) => {
+            var div_173 = root_73();
+            each(div_173, 5, () => (get2(state2), untrack(() => get2(state2).savedPositions)), index, ($$anchor4, pos, idx) => {
+              var div_174 = root_74();
+              var div_175 = child(div_174);
+              var text_39 = child(div_175, true);
+              reset(div_175);
+              var div_176 = sibling(div_175, 2);
+              var text_40 = child(div_176);
+              reset(div_176);
+              var div_177 = sibling(div_176, 2);
+              var button_35 = child(div_177);
+              var button_36 = sibling(button_35, 2);
+              reset(div_177);
+              reset(div_174);
               template_effect(
                 ($0, $1, $2) => {
                   set_text(text_39, (get2(pos), idx, untrack(() => get2(pos).name || `Position ${idx + 1}`)));
@@ -25363,20 +25569,20 @@ ${component_stack}
                   () => (get2(pos), untrack(() => fmt(get2(pos).z)))
                 ]
               );
-              event("click", button_34, () => store().moveSelectedTo(Number(get2(pos).x), Number(get2(pos).y), Number(get2(pos).z)));
-              event("click", button_35, () => store().deleteSavedPosition(idx));
-              append($$anchor4, div_167);
+              event("click", button_35, () => store().moveSelectedTo(Number(get2(pos).x), Number(get2(pos).y), Number(get2(pos).z)));
+              event("click", button_36, () => store().deleteSavedPosition(idx));
+              append($$anchor4, div_174);
             });
-            reset(div_166);
-            append($$anchor3, div_166);
+            reset(div_173);
+            append($$anchor3, div_173);
           };
-          if_block(node_42, ($$render) => {
-            if (get2(state2), untrack(() => get2(state2).savedPositions.length === 0)) $$render(consequent_43);
-            else $$render(alternate_12, -1);
+          if_block(node_44, ($$render) => {
+            if (get2(state2), untrack(() => get2(state2).savedPositions.length === 0)) $$render(consequent_45);
+            else $$render(alternate_13, -1);
           });
         }
-        reset(div_163);
-        event("click", button_32, () => {
+        reset(div_170);
+        event("click", button_33, () => {
           if (!get2(state2).viewportCursor) return;
           store().addSavedPosition({
             name: `Cursor ${(/* @__PURE__ */ new Date()).toLocaleTimeString()}`,
@@ -25385,7 +25591,7 @@ ${component_stack}
             z: get2(state2).viewportCursor.point.z
           });
         });
-        event("click", button_33, () => {
+        event("click", button_34, () => {
           if (!get2(selected)) return;
           store().addSavedPosition({
             name: `${get2(selected).label} center`,
@@ -25394,69 +25600,69 @@ ${component_stack}
             z: get2(selected).constraint.cz
           });
         });
-        append($$anchor2, div_163);
+        append($$anchor2, div_170);
       };
-      if_block(node_41, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "positions")) $$render(consequent_44);
+      if_block(node_43, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "positions")) $$render(consequent_46);
       });
     }
-    var node_43 = sibling(node_41, 2);
+    var node_45 = sibling(node_43, 2);
     {
-      var consequent_46 = ($$anchor2) => {
-        var div_171 = root_72();
-        var div_172 = sibling(child(div_171), 2);
-        var textarea = sibling(child(div_172), 2);
+      var consequent_48 = ($$anchor2) => {
+        var div_178 = root_75();
+        var div_179 = sibling(child(div_178), 2);
+        var textarea = sibling(child(div_179), 2);
         remove_textarea_child(textarea);
-        var div_173 = sibling(textarea, 2);
-        var button_36 = child(div_173);
-        reset(div_173);
-        reset(div_172);
-        var div_174 = sibling(div_172, 2);
-        var button_37 = child(div_174);
-        var button_38 = sibling(button_37, 2);
-        let classes_8;
-        var text_41 = child(button_38, true);
-        reset(button_38);
+        var div_180 = sibling(textarea, 2);
+        var button_37 = child(div_180);
+        reset(div_180);
+        reset(div_179);
+        var div_181 = sibling(div_179, 2);
+        var button_38 = child(div_181);
         var button_39 = sibling(button_38, 2);
-        var label_5 = sibling(button_39, 2);
-        var input_72 = sibling(child(label_5));
+        let classes_8;
+        var text_41 = child(button_39, true);
+        reset(button_39);
+        var button_40 = sibling(button_39, 2);
+        var label_5 = sibling(button_40, 2);
+        var input_76 = sibling(child(label_5));
         reset(label_5);
-        var button_40 = sibling(label_5, 2);
-        reset(div_174);
-        var div_175 = sibling(div_174, 2);
-        var textarea_1 = sibling(child(div_175), 2);
+        var button_41 = sibling(label_5, 2);
+        reset(div_181);
+        var div_182 = sibling(div_181, 2);
+        var textarea_1 = sibling(child(div_182), 2);
         remove_textarea_child(textarea_1);
-        reset(div_175);
-        var div_176 = sibling(div_175, 2);
-        var span_24 = child(div_176);
+        reset(div_182);
+        var div_183 = sibling(div_182, 2);
+        var span_24 = child(div_183);
         var text_42 = child(span_24);
         reset(span_24);
         var span_25 = sibling(span_24, 4);
         var text_43 = child(span_25);
         reset(span_25);
-        var node_44 = sibling(span_25, 2);
+        var node_46 = sibling(span_25, 2);
         {
-          var consequent_45 = ($$anchor3) => {
-            var span_26 = root_73();
+          var consequent_47 = ($$anchor3) => {
+            var span_26 = root_76();
             append($$anchor3, span_26);
           };
-          if_block(node_44, ($$render) => {
-            if (get2(state2), untrack(() => get2(state2).dirty)) $$render(consequent_45);
+          if_block(node_46, ($$render) => {
+            if (get2(state2), untrack(() => get2(state2).dirty)) $$render(consequent_47);
           });
         }
-        reset(div_176);
-        reset(div_171);
+        reset(div_183);
+        reset(div_178);
         template_effect(() => {
           set_value(textarea, (get2(state2), untrack(() => get2(state2).ui.mapImportText || "")));
-          classes_8 = set_class(button_38, 1, "btn btn-sm svelte-1nhql4u", null, classes_8, { feedback: get2(copyFeedback) });
+          classes_8 = set_class(button_39, 1, "btn btn-sm svelte-1nhql4u", null, classes_8, { feedback: get2(copyFeedback) });
           set_text(text_41, get2(copyFeedback) ? "\u2713 Copied!" : "\u2398 Copy JSON");
           set_text(text_42, `${(get2(state2), untrack(() => get2(state2).constraints.length)) ?? ""} constraints`);
           set_text(text_43, `Map: ${(get2(state2), untrack(() => get2(state2).editorIntegration.mapRef || "unknown")) ?? ""}`);
         });
         event("input", textarea, (e) => updateMapImportText(e.currentTarget.value));
         event("keydown", textarea, onMapImportKeydown);
-        event("click", button_36, runMapAutoImport);
-        event("click", button_37, () => exportConstraintDocument({
+        event("click", button_37, runMapAutoImport);
+        event("click", button_38, () => exportConstraintDocument({
           mapRef: get2(state2).editorIntegration.mapRef,
           name: `${get2(state2).editorIntegration.mapRef || "map"} constraints`,
           constraints: get2(state2).constraints,
@@ -25465,17 +25671,17 @@ ${component_stack}
           ui: get2(state2).ui,
           selectedConstraintId: get2(state2).selectedConstraintId
         }));
-        event("click", button_38, copyJson);
-        event("click", button_39, loadJsonText);
-        event("change", input_72, onImportFile);
-        event("click", button_40, () => {
+        event("click", button_39, copyJson);
+        event("click", button_40, loadJsonText);
+        event("change", input_76, onImportFile);
+        event("click", button_41, () => {
           if (confirm(`Clear all ${get2(state2).constraints.length} constraints?`)) store().clearAllConstraints();
         });
         bind_value(textarea_1, () => get2(jsonText), ($$value) => set(jsonText, $$value));
-        append($$anchor2, div_171);
+        append($$anchor2, div_178);
       };
-      if_block(node_43, ($$render) => {
-        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "io")) $$render(consequent_46);
+      if_block(node_45, ($$render) => {
+        if (get2(state2), untrack(() => get2(state2).ui.activeTab === "io")) $$render(consequent_48);
       });
     }
     reset(div_11);
@@ -25812,6 +26018,7 @@ ${component_stack}
       LookDirection: 11051263,
       LookRange: 8154367,
       SpeedWindow: 16769126,
+      SpeedLockedBox: 10151604,
       VelocityDirection: 16763213,
       TurnConstraint: 16754219,
       StateCheckpoint: 16739179
@@ -25830,6 +26037,7 @@ ${component_stack}
       LookDirection: 13404415,
       LookRange: 10049023,
       SpeedWindow: 16776960,
+      SpeedLockedBox: 65433,
       VelocityDirection: 16768256,
       TurnConstraint: 16746496,
       StateCheckpoint: 16711748
@@ -25848,6 +26056,7 @@ ${component_stack}
       LookDirection: 12632256,
       LookRange: 11579568,
       SpeedWindow: 14211288,
+      SpeedLockedBox: 12114120,
       VelocityDirection: 13158600,
       TurnConstraint: 12105912,
       StateCheckpoint: 10526880
@@ -26179,6 +26388,7 @@ ${component_stack}
         case "PlaneCheckpoint":
         case "TakeoffZone":
         case "LandingZone":
+        case "SpeedLockedBox":
           return createZoneVisual(color, "zone");
         case "LineSegment":
         case "Corridor":
@@ -26328,9 +26538,10 @@ ${component_stack}
       case "SoftCheckpoint":
       case "TakeoffZone":
       case "LandingZone":
+      case "SpeedLockedBox":
       case "PlaneCheckpoint": {
         const zone = helper.getObjectByName("zone") || helper;
-        updateZoneVisual(zone, record.constraint.hitboxType, {
+        updateZoneVisual(zone, type === "SpeedLockedBox" ? "box" : record.constraint.hitboxType, {
           radius: record.constraint.radius,
           height: record.constraint.height,
           sizeX: record.constraint.sizeX,

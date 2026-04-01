@@ -449,6 +449,50 @@ export function createStore(initialState = {}) {
         }),
       );
     },
+    moveTrainGroupToIndex(idOrGroup, targetIndex) {
+      setState((s) =>
+        withHistory(s, () => {
+          const groupId = resolveTrainGroupId(s.constraints, idOrGroup);
+          if (!groupId) return s;
+          const indices = [];
+          for (let i = 0; i < s.constraints.length; i++) {
+            const record = s.constraints[i];
+            if (
+              isGroupedJumpArc(record) &&
+              record.constraint.trainGroupId === groupId
+            ) {
+              indices.push(i);
+            }
+          }
+          if (!indices.length) return s;
+
+          const first = indices[0];
+          const last = indices[indices.length - 1];
+          const rawTarget = Math.max(
+            0,
+            Math.min(
+              s.constraints.length,
+              Math.floor(Number.isFinite(Number(targetIndex)) ? Number(targetIndex) : 0),
+            ),
+          );
+          if (rawTarget >= first && rawTarget <= last + 1) {
+            return s;
+          }
+
+          const removeSet = new Set(indices);
+          const block = s.constraints.filter((_, idx) => removeSet.has(idx));
+          const remaining = s.constraints.filter((_, idx) => !removeSet.has(idx));
+          const removedBeforeTarget = indices.filter((idx) => idx < rawTarget).length;
+          const insertAt = Math.max(
+            0,
+            Math.min(remaining.length, rawTarget - removedBeforeTarget),
+          );
+          const next = [...remaining];
+          next.splice(insertAt, 0, ...block);
+          return { ...s, constraints: next };
+        }),
+      );
+    },
     selectConstraint(id) {
       setState((s) => ({ ...s, selectedConstraintId: id }));
     },

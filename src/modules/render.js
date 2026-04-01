@@ -15,6 +15,7 @@ const PALETTES = {
     LookDirection: 0xa8a0ff,
     LookRange: 0x7c6cff,
     SpeedWindow: 0xffe066,
+    SpeedLockedBox: 0x9ae6b4,
     VelocityDirection: 0xffc94d,
     TurnConstraint: 0xffa62b,
     StateCheckpoint: 0xff6b6b,
@@ -33,6 +34,7 @@ const PALETTES = {
     LookDirection: 0xcc88ff,
     LookRange: 0x9955ff,
     SpeedWindow: 0xffff00,
+    SpeedLockedBox: 0x00ff99,
     VelocityDirection: 0xffdd00,
     TurnConstraint: 0xff8800,
     StateCheckpoint: 0xff0044,
@@ -51,6 +53,7 @@ const PALETTES = {
     LookDirection: 0xc0c0c0,
     LookRange: 0xb0b0b0,
     SpeedWindow: 0xd8d8d8,
+    SpeedLockedBox: 0xb8d8c8,
     VelocityDirection: 0xc8c8c8,
     TurnConstraint: 0xb8b8b8,
     StateCheckpoint: 0xa0a0a0,
@@ -436,6 +439,7 @@ function createTypedHelper(record, theme) {
       case "PlaneCheckpoint":
       case "TakeoffZone":
       case "LandingZone":
+      case "SpeedLockedBox":
         return createZoneVisual(color, "zone");
       case "LineSegment":
       case "Corridor":
@@ -613,9 +617,10 @@ function updateHelper(
     case "SoftCheckpoint":
     case "TakeoffZone":
     case "LandingZone":
+    case "SpeedLockedBox":
     case "PlaneCheckpoint": {
       const zone = helper.getObjectByName("zone") || helper;
-      updateZoneVisual(zone, record.constraint.hitboxType, {
+      updateZoneVisual(zone, type === "SpeedLockedBox" ? "box" : record.constraint.hitboxType, {
         radius: record.constraint.radius,
         height: record.constraint.height,
         sizeX: record.constraint.sizeX,

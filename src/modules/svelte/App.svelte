@@ -49,6 +49,7 @@
         "yawMax",
         "minSpeed",
         "maxSpeed",
+        "unlockSpeed",
         "targetYaw",
         "maxDeltaRad",
         "takeoffCx",
@@ -69,6 +70,7 @@
         "landingSizeZ",
     ]);
     const SEGMENT_HITBOX_TYPES = ["sphere", "cylinder", "box"];
+    const SPEED_DISPLAY_SCALE = 1000;
     let editLabel = "";
     let editType = "HardCheckpoint";
     let editConstraint = {};
@@ -104,6 +106,7 @@
         LookDirection: "#bc8cff",
         LookRange: "#a371f7",
         SpeedWindow: "#f2cc60",
+        SpeedLockedBox: "#7ee787",
         VelocityDirection: "#e3b341",
         TurnConstraint: "#d29922",
         StateCheckpoint: "#ff7b72",
@@ -123,6 +126,7 @@
         LookDirection: "➤",
         LookRange: "⌖",
         SpeedWindow: "⚡",
+        SpeedLockedBox: "▣",
         VelocityDirection: "↗",
         TurnConstraint: "↻",
         StateCheckpoint: "◈",
@@ -134,9 +138,8 @@
     $: selectedTrainGroupId = isTrainArcRecord(selected)
         ? selected.constraint.trainGroupId
         : (state.trainPlacementGroupId || null);
-    $: selectedTrainGroup = selectedTrainGroupId
-        ? store.getTrainGroupView(selectedTrainGroupId)
-        : null;
+    $: selectedTrainGroup = (state.constraints,
+        selectedTrainGroupId ? store.getTrainGroupView(selectedTrainGroupId) : null);
     $: trainEditorTargetId = selectedTrainGroupId || selected?.id || null;
     $: currentMapRef = state.editorIntegration.mapRef || "unknown-map";
     $: if (state.ui.activeTab === "list")
@@ -154,7 +157,8 @@
         selectedType === "SoftCheckpoint" ||
         selectedType === "TakeoffZone" ||
         selectedType === "LandingZone" ||
-        selectedType === "PlaneCheckpoint";
+        selectedType === "PlaneCheckpoint" ||
+        selectedType === "SpeedLockedBox";
     $: usesDirection =
         selectedType === "PlaneCheckpoint" ||
         selectedType === "LookDirection" ||
@@ -164,6 +168,7 @@
     $: usesJumpTrain =
         Boolean(selectedTrainGroup) || selected?.constraint?.type === "JumpTrain";
     $: showSpeedWindow = selectedType === "SpeedWindow";
+    $: showSpeedLockedBox = selectedType === "SpeedLockedBox";
     $: showTurn = selectedType === "TurnConstraint";
     $: showState = selectedType === "StateCheckpoint";
     $: showLookDirection = selectedType === "LookDirection";
@@ -382,14 +387,30 @@
         commitLiveConstraint(editLabel, editType, nextConstraint);
     }
 
+    function speedToDisplay(value, fallback = 0) {
+        const n = Number(value);
+        const scaled = (Number.isFinite(n) ? n : fallback) * SPEED_DISPLAY_SCALE;
+        return Number(scaled.toFixed(2));
+    }
+
+    function displayToSpeed(value, fallback = 0) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n / SPEED_DISPLAY_SCALE : fallback;
+    }
+
     function updateEditLabel(value) {
         editLabel = value;
         commitLiveConstraint(value, editType, editConstraint);
     }
 
     function updateEditType(value) {
+        const nextConstraint =
+            value === "SpeedLockedBox"
+                ? { ...editConstraint, hitboxType: "box" }
+                : editConstraint;
         editType = value;
-        commitLiveConstraint(editLabel, value, editConstraint);
+        editConstraint = nextConstraint;
+        commitLiveConstraint(editLabel, value, nextConstraint);
     }
 
     function applySelected() {
@@ -563,10 +584,47 @@
         store.nudgeSelected({ x, y, z });
     }
 
-    function onDragStart(event, id) {
-        draggingId = id;
+    function getConstraintIndexForRow(record) {
+        if (record?.isVirtualTrainGroup) {
+            const group = store.getTrainGroupView(record.id);
+            const firstArcId = group?.arcIds?.[0] || null;
+            if (!firstArcId) {
+                return -1;
+            }
+            return state.constraints.findIndex((c) => c.id === firstArcId);
+        }
+        if (record?.isVirtualTrainArc && record?.targetConstraintId) {
+            return state.constraints.findIndex(
+                (c) => c.id === record.targetConstraintId,
+            );
+        }
+        return state.constraints.findIndex((c) => c.id === record?.id);
+    }
+
+    function parseDragPayload(raw) {
+        const token = String(raw || "");
+        if (!token) return null;
+        if (token.startsWith("group:")) {
+            const groupId = token.slice("group:".length);
+            return groupId ? { kind: "group", id: groupId } : null;
+        }
+        if (token.startsWith("constraint:")) {
+            const id = token.slice("constraint:".length);
+            return id ? { kind: "constraint", id } : null;
+        }
+        if (state.constraints.some((c) => c.id === token)) {
+            return { kind: "constraint", id: token };
+        }
+        return null;
+    }
+
+    function onDragStart(event, record) {
+        if (!record || record.isVirtualTrainArc) return;
+        draggingId = record.isVirtualTrainGroup
+            ? `group:${record.id}`
+            : `constraint:${record.id}`;
         event.dataTransfer.effectAllowed = "move";
-        event.dataTransfer.setData("text/plain", id);
+        event.dataTransfer.setData("text/plain", draggingId);
     }
     function onDragOver(event, id) {
         event.preventDefault();
@@ -574,29 +632,48 @@
     }
     function onDropOnItem(event, targetRecord) {
         event.preventDefault();
-        const id = draggingId || event.dataTransfer.getData("text/plain");
-        const targetId = targetRecord?.targetConstraintId || targetRecord?.id;
-        if (!id || !targetId || id === targetId) {
+        const drag = parseDragPayload(
+            draggingId || event.dataTransfer.getData("text/plain"),
+        );
+        const target = getConstraintIndexForRow(targetRecord);
+        if (!drag || target < 0) {
             draggingId = dragOverId = null;
             return;
         }
-        const from = state.constraints.findIndex((c) => c.id === id);
-        const target = state.constraints.findIndex((c) => c.id === targetId);
-        if (from < 0 || target < 0) {
+        if (drag.kind === "group") {
+            if (targetRecord?.isVirtualTrainGroup && targetRecord.id === drag.id) {
+                draggingId = dragOverId = null;
+                return;
+            }
+            store.moveTrainGroupToIndex(drag.id, target);
             draggingId = dragOverId = null;
             return;
         }
-        store.moveConstraintToIndex(id, from < target ? target - 1 : target);
+        const from = state.constraints.findIndex((c) => c.id === drag.id);
+        if (from < 0) {
+            draggingId = dragOverId = null;
+            return;
+        }
+        store.moveConstraintToIndex(
+            drag.id,
+            from < target ? target - 1 : target,
+        );
         draggingId = dragOverId = null;
     }
     function onDropToEnd(event) {
         event.preventDefault();
-        const id = draggingId || event.dataTransfer.getData("text/plain");
-        if (!id) {
+        const drag = parseDragPayload(
+            draggingId || event.dataTransfer.getData("text/plain"),
+        );
+        if (!drag) {
             draggingId = dragOverId = null;
             return;
         }
-        store.moveConstraintToIndex(id, state.constraints.length - 1);
+        if (drag.kind === "group") {
+            store.moveTrainGroupToIndex(drag.id, state.constraints.length);
+        } else {
+            store.moveConstraintToIndex(drag.id, state.constraints.length - 1);
+        }
         draggingId = dragOverId = null;
     }
 
@@ -707,7 +784,7 @@
         <div class="clist">
             {#each constraintsFiltered as record, index (record.id)}
                 <button
-                    draggable={!record.isVirtualTrainGroup && !record.isVirtualTrainArc}
+                    draggable={!record.isVirtualTrainArc}
                     class="citem"
                     class:train-child={record.isVirtualTrainArc}
                     class:selected={record.isVirtualTrainGroup
@@ -718,14 +795,9 @@
                     class:disabled={!record.enabled}
                     class:dragover={dragOverId === record.id}
                     style="--tc: {typeColor(record.constraint.type)}"
-                    on:dragstart={(e) =>
-                        !record.isVirtualTrainGroup &&
-                        !record.isVirtualTrainArc &&
-                        onDragStart(e, record.id)}
-                    on:dragover={(e) =>
-                        !record.isVirtualTrainGroup && onDragOver(e, record.id)}
-                    on:drop={(e) =>
-                        !record.isVirtualTrainGroup && onDropOnItem(e, record)}
+                    on:dragstart={(e) => onDragStart(e, record)}
+                    on:dragover={(e) => onDragOver(e, record.id)}
+                    on:drop={(e) => onDropOnItem(e, record)}
                     on:dragend={() => {
                         draggingId = null;
                         dragOverId = null;
@@ -755,9 +827,7 @@
                         <span class="citem-badge sel">SEL</span>
                     {/if}
                     <span class="citem-handle" title="Drag to reorder"
-                        >{record.isVirtualTrainGroup || record.isVirtualTrainArc
-                            ? ""
-                            : "⠿"}</span
+                        >{record.isVirtualTrainArc ? "" : "⠿"}</span
                     >
                 </button>
             {/each}
@@ -985,80 +1055,7 @@
                         {#if usesSingleZone}
                             <div class="field-group">
                                 <div class="field-label">Hitbox</div>
-                                <div class="row gap-8">
-                                    <select
-                                        class="input"
-                                        value={editConstraint.hitboxType ||
-                                            "sphere"}
-                                        on:change={(e) =>
-                                            updateEditField(
-                                                "hitboxType",
-                                                e.currentTarget.value,
-                                            )}
-                                    >
-                                        {#each HITBOX_TYPES as shape}
-                                            <option value={shape}
-                                                >{shape}</option
-                                            >
-                                        {/each}
-                                    </select>
-                                </div>
-                                {#if (editConstraint.hitboxType || "sphere") === "sphere" || (editConstraint.hitboxType || "sphere") === "circle"}
-                                    <div class="row gap-8 align-center">
-                                        <input
-                                            class="input mono grow"
-                                            type="number"
-                                            step="any"
-                                            min="0"
-                                            value={editConstraint.radius ?? 8}
-                                            on:input={(e) =>
-                                                updateEditField(
-                                                    "radius",
-                                                    e.currentTarget.value,
-                                                )}
-                                        />
-                                        <span class="dim-note">radius</span>
-                                    </div>
-                                {:else if (editConstraint.hitboxType || "sphere") === "cylinder"}
-                                    <div class="xyz-grid">
-                                        <div class="xyz-field">
-                                            <span class="xyz-axis z"
-                                                >Radius</span
-                                            >
-                                            <input
-                                                class="input mono"
-                                                type="number"
-                                                step="any"
-                                                min="0"
-                                                value={editConstraint.radius ??
-                                                    8}
-                                                on:input={(e) =>
-                                                    updateEditField(
-                                                        "radius",
-                                                        e.currentTarget.value,
-                                                    )}
-                                            />
-                                        </div>
-                                        <div class="xyz-field">
-                                            <span class="xyz-axis y"
-                                                >Height</span
-                                            >
-                                            <input
-                                                class="input mono"
-                                                type="number"
-                                                step="any"
-                                                min="0"
-                                                value={editConstraint.height ??
-                                                    6}
-                                                on:input={(e) =>
-                                                    updateEditField(
-                                                        "height",
-                                                        e.currentTarget.value,
-                                                    )}
-                                            />
-                                        </div>
-                                    </div>
-                                {:else}
+                                {#if selectedType === "SpeedLockedBox"}
                                     <div class="field-actions">
                                         <button
                                             class="btn btn-xs btn-accent"
@@ -1123,6 +1120,146 @@
                                             />
                                         </div>
                                     </div>
+                                {:else}
+                                    <div class="row gap-8">
+                                        <select
+                                            class="input"
+                                            value={editConstraint.hitboxType ||
+                                                "sphere"}
+                                            on:change={(e) =>
+                                                updateEditField(
+                                                    "hitboxType",
+                                                    e.currentTarget.value,
+                                                )}
+                                        >
+                                            {#each HITBOX_TYPES as shape}
+                                                <option value={shape}
+                                                    >{shape}</option
+                                                >
+                                            {/each}
+                                        </select>
+                                    </div>
+                                    {#if (editConstraint.hitboxType || "sphere") === "sphere" || (editConstraint.hitboxType || "sphere") === "circle"}
+                                        <div class="row gap-8 align-center">
+                                            <input
+                                                class="input mono grow"
+                                                type="number"
+                                                step="any"
+                                                min="0"
+                                                value={editConstraint.radius ?? 8}
+                                                on:input={(e) =>
+                                                    updateEditField(
+                                                        "radius",
+                                                        e.currentTarget.value,
+                                                    )}
+                                            />
+                                            <span class="dim-note">radius</span>
+                                        </div>
+                                    {:else if (editConstraint.hitboxType || "sphere") === "cylinder"}
+                                        <div class="xyz-grid">
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis z"
+                                                    >Radius</span
+                                                >
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    min="0"
+                                                    value={editConstraint.radius ??
+                                                        8}
+                                                    on:input={(e) =>
+                                                        updateEditField(
+                                                            "radius",
+                                                            e.currentTarget.value,
+                                                        )}
+                                                />
+                                            </div>
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis y"
+                                                    >Height</span
+                                                >
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    min="0"
+                                                    value={editConstraint.height ??
+                                                        6}
+                                                    on:input={(e) =>
+                                                        updateEditField(
+                                                            "height",
+                                                            e.currentTarget.value,
+                                                        )}
+                                                />
+                                            </div>
+                                        </div>
+                                    {:else}
+                                        <div class="field-actions">
+                                            <button
+                                                class="btn btn-xs btn-accent"
+                                                on:click={() =>
+                                                    beginRaycastPlacement("size")}
+                                                >Pick Box Size</button
+                                            >
+                                        </div>
+                                        <div class="xyz-grid">
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis x"
+                                                    >Size X</span
+                                                >
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    min="0"
+                                                    value={editConstraint.sizeX ??
+                                                        8}
+                                                    on:input={(e) =>
+                                                        updateEditField(
+                                                            "sizeX",
+                                                            e.currentTarget.value,
+                                                        )}
+                                                />
+                                            </div>
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis y"
+                                                    >Size Y</span
+                                                >
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    min="0"
+                                                    value={editConstraint.sizeY ??
+                                                        8}
+                                                    on:input={(e) =>
+                                                        updateEditField(
+                                                            "sizeY",
+                                                            e.currentTarget.value,
+                                                        )}
+                                                />
+                                            </div>
+                                            <div class="xyz-field">
+                                                <span class="xyz-axis z"
+                                                    >Size Z</span
+                                                >
+                                                <input
+                                                    class="input mono"
+                                                    type="number"
+                                                    step="any"
+                                                    min="0"
+                                                    value={editConstraint.sizeZ ??
+                                                        8}
+                                                    on:input={(e) =>
+                                                        updateEditField(
+                                                            "sizeZ",
+                                                            e.currentTarget.value,
+                                                        )}
+                                                />
+                                            </div>
+                                        </div>
+                                    {/if}
                                 {/if}
                             </div>
                         {/if}
@@ -2183,6 +2320,33 @@
                                                 )}
                                         />
                                     </div>
+                                </div>
+                            </div>
+                        {/if}
+
+                        {#if showSpeedLockedBox}
+                            <div class="field-group">
+                                <div class="field-label">Box Lock Speed</div>
+                                <div class="row gap-8 align-center">
+                                    <input
+                                        class="input mono grow"
+                                        type="number"
+                                        step="any"
+                                        min="0"
+                                        value={speedToDisplay(
+                                            editConstraint.unlockSpeed,
+                                            0.02,
+                                        )}
+                                        on:input={(e) =>
+                                            updateEditField(
+                                                "unlockSpeed",
+                                                displayToSpeed(
+                                                    e.currentTarget.value,
+                                                    0.02,
+                                                ),
+                                            )}
+                                    />
+                                    <span class="dim-note">min speed to leave box</span>
                                 </div>
                             </div>
                         {/if}
